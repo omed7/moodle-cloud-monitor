@@ -17,7 +17,7 @@ jobs:
           python-version: '3.10'
 
       - name: Install Dependencies
-        run: pip install aiohttp beautifulsoup4
+        run: pip install aiohttp==3.9.3 beautifulsoup4==4.12.3
 
       - name: Run Goldilocks Scanner
         env:
