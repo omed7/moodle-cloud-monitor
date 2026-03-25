@@ -320,11 +320,10 @@ async def scan_moodle(memory, notifications):
         return False, False
 
 # ==========================================
-# 7. THE CLOUD BATCH TRIGGER
+# 7. THE CLOUD BATCH TRIGGER (OPTIMIZED)
 # ==========================================
 async def main():
     print("🚀 Booting Cloud Monitor...")
-    # Using 'await' because our memory functions are now async network calls
     memory = await load_memory()
     notifications = [] 
     
@@ -335,11 +334,14 @@ async def main():
     any_updates = moodle_updated or timetable_updated or deadlines_updated
     all_servers_ok = moodle_ok and timetable_ok and deadlines_ok
     
+    # We create a simple switch to track if we ACTUALLY need to use a JSONBin PUT request
+    memory_changed = False
+    
     if not all_servers_ok:
         if memory.get("server_status") != "failed":
             await send_telegram("🚨 SCAN FAILED\nCould not connect to the university servers. I will stay silent until the connection is restored.")
             memory["server_status"] = "failed"
-            await save_memory(memory)
+            memory_changed = True
             print("❌ Servers are down. Sent failure alert.")
         else:
             print("❌ Servers are still down. Remaining silent to avoid spam.")
@@ -348,6 +350,7 @@ async def main():
         if memory.get("server_status") == "failed":
             notifications.append("✅ CONNECTION RESTORED\nThe university servers are back online. Resuming normal scans.")
             memory["server_status"] = "ok"
+            memory_changed = True
             print("✅ Servers recovered.")
             
         if notifications:
@@ -356,12 +359,18 @@ async def main():
             for i in range(0, len(final_message), 4000):
                 await send_telegram(final_message[i:i+4000])
                 
-            await save_memory(memory)
-            print(f"✅ Memory saved to JSONBin. Sent {len(notifications)} updates!")
+            memory_changed = True
+            print(f"✅ Sent {len(notifications)} updates!")
             
         else:
-            await save_memory(memory)
             print("💤 No changes found. Staying perfectly silent.")
+
+    # THE BRILLIANT FIX: Only spend an API request if the memory actually changed!
+    if memory_changed or any_updates:
+        await save_memory(memory)
+        print("☁️ Memory changes detected. Saved to JSONBin.")
+    else:
+        print("🛑 Skipped saving to JSONBin (No API request wasted).")
 
 if __name__ == "__main__":
     asyncio.run(main())
