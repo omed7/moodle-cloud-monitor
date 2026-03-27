@@ -61,7 +61,7 @@ async def send_telegram(session, message, target_chat):
         await fetch_data(session, TELEGRAM_URL, post_data=payload, return_json=True)
         await asyncio.sleep(1) # Protects against Telegram spam limits during broadcasts
     except Exception:
-        pass # If a user blocks the bot, it silently fails and continues to the next person
+        pass 
 
 # ==========================================
 # 3. AUTO-HARVESTER
@@ -381,8 +381,23 @@ async def main():
             memory.setdefault("chat_ids", []).append(str(CHAT_ID))
             memory_changed = True
             
+        # --- NEW: SELF-CLEANING DEDUPLICATION ---
+        if "chat_ids" in memory:
+            original_count = len(memory["chat_ids"])
+            
+            # Converts all to strings, strips spaces, removes duplicates, drops "0" and empty entries
+            cleaned_ids = list(set([
+                str(cid).strip() for cid in memory["chat_ids"] 
+                if str(cid).strip() not in ["0", "", "None"]
+            ]))
+            
+            if len(cleaned_ids) != original_count:
+                memory["chat_ids"] = cleaned_ids
+                memory_changed = True
+        # ----------------------------------------
+
         # Fallback for Admin ID if not strictly provided in secrets
-        current_admin = ADMIN_CHAT_ID if ADMIN_CHAT_ID else (memory["chat_ids"][0] if memory["chat_ids"] else None)
+        current_admin = ADMIN_CHAT_ID if ADMIN_CHAT_ID else (memory.get("chat_ids", [None])[0] if memory.get("chat_ids") else None)
 
         # 2. RUN CONCURRENT SCANS
         results = await asyncio.gather(
@@ -440,13 +455,13 @@ async def main():
                 
                 messages_to_send.append(current_msg)
 
-                # Loop through every harvested chat ID and send the updates
+                # Loop through every cleanly harvested chat ID and send the updates once
                 for msg in messages_to_send:
                     for target_chat in memory.get("chat_ids", []):
                         await send_telegram(session, msg, target_chat)
                 
                 memory_changed = True
-                print(f"✅ Broadcasted {len(notifications)} updates to {len(memory.get('chat_ids', []))} chats!")
+                print(f"✅ Broadcasted {len(notifications)} updates to {len(memory.get('chat_ids', []))} unique chats!")
 
         # 5. SAVE STATE
         if memory_changed or any_updates:
