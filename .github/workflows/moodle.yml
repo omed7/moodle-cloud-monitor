@@ -24,6 +24,7 @@ jobs:
           MOODLE_API_TOKEN: ${{ secrets.MOODLE_API_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
+          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
           MOODLE_API_URL: ${{ secrets.MOODLE_API_URL }}
           JSONBIN_ID: ${{ secrets.JSONBIN_ID }}
           JSONBIN_KEY: ${{ secrets.JSONBIN_KEY }}
