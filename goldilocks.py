@@ -14,6 +14,7 @@ IGNORE_COURSES = ["195", "196", "197", "198", "199", "200", "201"]
 API_TOKEN = os.environ.get("MOODLE_API_TOKEN")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", CHAT_ID) # Fallback to CHAT_ID if admin not set
 RAW_URL = os.environ.get("MOODLE_API_URL", "https://moodle.uod.ac")
 
 JSONBIN_ID = os.environ.get("JSONBIN_ID")
@@ -48,9 +49,10 @@ async def fetch_data(session, url, is_moodle=False, post_data=None, return_json=
             resp.raise_for_status()
             return await resp.json() if return_json else await resp.text()
 
-async def send_telegram(session, message):
+async def send_telegram(session, message, target_chat=None):
+    chat_to_use = target_chat if target_chat else CHAT_ID 
     payload = {
-        "chat_id": CHAT_ID, 
+        "chat_id": chat_to_use, 
         "text": message,
         "parse_mode": "HTML",
         "disable_web_page_preview": True
@@ -351,8 +353,8 @@ async def main():
                 memory["server_status"] = "warning"
                 memory_changed = True
             elif current_status == "warning":
-                await send_telegram(session, "🚨 <b>SCAN FAILED</b>\nCould not connect to the university servers for two consecutive scans. I will stay silent until the connection is restored.")
-                print("❌ Servers down (Strike 2). Sent failure alert.")
+                await send_telegram(session, "🚨 <b>SCAN FAILED</b>\nCould not connect to the university servers for two consecutive scans. I will stay silent until the connection is restored.", target_chat=ADMIN_CHAT_ID)
+                print("❌ Servers down (Strike 2). Sent failure alert to admin.")
                 memory["server_status"] = "failed"
                 memory_changed = True
             else:
@@ -362,7 +364,7 @@ async def main():
             current_status = memory.get("server_status", "ok")
             if current_status in ["failed", "warning"]:
                 if current_status == "failed":
-                    notifications.append("✅ <b>CONNECTION RESTORED</b>\nThe university servers are back online.")
+                    await send_telegram(session, "✅ <b>CONNECTION RESTORED</b>\nThe university servers are back online.", target_chat=ADMIN_CHAT_ID)
                 memory["server_status"] = "ok"
                 memory_changed = True
                 print("✅ Servers recovered.")
