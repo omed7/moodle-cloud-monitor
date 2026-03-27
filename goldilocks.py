@@ -5,6 +5,10 @@ import socket
 import time
 import datetime
 from bs4 import BeautifulSoup
+import requests
+
+__version__ = "2.0.0"
+
 
 # ==========================================
 # 1. SETUP & CONFIGURATION
