@@ -13,8 +13,8 @@ IGNORE_COURSES = ["195", "196", "197", "198", "199", "200", "201"]
 
 API_TOKEN = os.environ.get("MOODLE_API_TOKEN")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", CHAT_ID) # Fallback to CHAT_ID if admin not set
+CHAT_ID = os.environ.get("CHAT_ID") # Used as a fallback/initial group
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID") # For private server alerts
 RAW_URL = os.environ.get("MOODLE_API_URL", "https://moodle.uod.ac")
 
 JSONBIN_ID = os.environ.get("JSONBIN_ID")
@@ -28,12 +28,13 @@ else:
     MOODLE_URL = RAW_URL
 
 TELEGRAM_URL = f"https://moodle-tele-proxy.fy20155.workers.dev/bot{BOT_TOKEN}/sendMessage"
+TELEGRAM_UPDATES_URL = f"https://moodle-tele-proxy.fy20155.workers.dev/bot{BOT_TOKEN}/getUpdates"
 
 def safe_html(text):
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 # ==========================================
-# 2. NETWORK HELPER (Upgraded for Session Reuse)
+# 2. NETWORK HELPER
 # ==========================================
 async def fetch_data(session, url, is_moodle=False, post_data=None, return_json=True):
     headers = {}
@@ -49,26 +50,68 @@ async def fetch_data(session, url, is_moodle=False, post_data=None, return_json=
             resp.raise_for_status()
             return await resp.json() if return_json else await resp.text()
 
-async def send_telegram(session, message, target_chat=None):
-    chat_to_use = target_chat if target_chat else CHAT_ID 
+async def send_telegram(session, message, target_chat):
     payload = {
-        "chat_id": chat_to_use, 
+        "chat_id": target_chat, 
         "text": message,
         "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
     try:
         await fetch_data(session, TELEGRAM_URL, post_data=payload, return_json=True)
-        await asyncio.sleep(1) 
+        await asyncio.sleep(1) # Protects against Telegram spam limits during broadcasts
     except Exception:
-        pass
+        pass # If a user blocks the bot, it silently fails and continues to the next person
 
 # ==========================================
-# 3. CLOUD MEMORY MANAGEMENT (JSONBIN)
+# 3. AUTO-HARVESTER
+# ==========================================
+async def harvest_chat_ids(memory, session):
+    print("📡 Harvesting new Telegram users & groups...")
+    updates_found = False
+    offset = memory.get("last_update_id", 0) + 1
+    url = f"{TELEGRAM_UPDATES_URL}?offset={offset}"
+    
+    try:
+        data = await fetch_data(session, url, return_json=True)
+        if isinstance(data, dict) and data.get("ok"):
+            for result in data.get("result", []):
+                update_id = result.get("update_id")
+                
+                # Acknowledge the update so we don't process it again
+                if update_id and update_id >= memory.get("last_update_id", 0):
+                    memory["last_update_id"] = update_id
+                    updates_found = True
+                
+                # Safely extract the Chat ID depending on the event type
+                chat_id = None
+                if "message" in result: 
+                    chat_id = str(result["message"]["chat"]["id"])
+                elif "my_chat_member" in result: 
+                    chat_id = str(result["my_chat_member"]["chat"]["id"])
+                elif "channel_post" in result: 
+                    chat_id = str(result["channel_post"]["chat"]["id"])
+                    
+                if chat_id:
+                    if "chat_ids" not in memory: memory["chat_ids"] = []
+                    if chat_id not in memory["chat_ids"]:
+                        memory["chat_ids"].append(chat_id)
+                        print(f"🆕 New destination registered: {chat_id}")
+                        updates_found = True
+    except Exception as e:
+        print(f"⚠️ Failed to harvest IDs: {e}")
+        
+    return updates_found
+
+# ==========================================
+# 4. CLOUD MEMORY MANAGEMENT (JSONBIN)
 # ==========================================
 async def load_memory(session):
     print("☁️ Fetching memory from Cloud Database...")
-    default_memory = {"grades": {}, "files": {}, "timetable": {}, "deadlines": {}, "server_status": "ok"}
+    default_memory = {
+        "grades": {}, "files": {}, "timetable": {}, "deadlines": {}, 
+        "server_status": "ok", "chat_ids": [], "last_update_id": 0
+    }
     if not JSONBIN_ID or not JSONBIN_KEY: return default_memory
         
     url = f"https://api.jsonbin.io/v3/b/{JSONBIN_ID}"
@@ -103,7 +146,7 @@ async def save_memory(session, memory):
     except Exception: pass
 
 # ==========================================
-# 4. DEADLINE RADAR
+# 5. DEADLINE RADAR
 # ==========================================
 async def scan_deadlines(memory, notifications, session):
     print("⏳ Scanning Deadlines...")
@@ -133,7 +176,7 @@ async def scan_deadlines(memory, notifications, session):
     except Exception: return False, False
 
 # ==========================================
-# 5. TIMETABLE SCANNER
+# 6. TIMETABLE SCANNER
 # ==========================================
 def parse_timetable(html):
     soup = BeautifulSoup(html, 'html.parser')
@@ -201,7 +244,7 @@ async def scan_timetable(memory, notifications, session):
     except Exception: return False, False
 
 # ==========================================
-# 6. MOODLE SCANNER
+# 7. MOODLE SCANNER
 # ==========================================
 def format_file_name(mod_name, mod_type):
     name_lower = mod_name.lower()
@@ -318,19 +361,30 @@ async def scan_moodle(memory, notifications, session):
     except Exception: return False, False
 
 # ==========================================
-# 7. THE CLOUD BATCH TRIGGER
+# 8. THE CLOUD BATCH TRIGGER
 # ==========================================
 async def main():
     print("🚀 Booting Cloud Monitor...")
     
-    # Session Reuse: Creates ONE single network engine for the whole script
     connector = aiohttp.TCPConnector(ssl=False, family=socket.AF_INET)
     async with aiohttp.ClientSession(connector=connector) as session:
         memory = await load_memory(session)
         notifications = [] 
         memory_changed = False
         
-        # Concurrency: Run all three scans at the exact same time
+        # 1. HARVEST NEW CHAT IDs BEFORE SCANNING
+        if await harvest_chat_ids(memory, session):
+            memory_changed = True
+            
+        # Ensure your primary CHAT_ID from secrets is always safely in the list
+        if CHAT_ID and str(CHAT_ID) not in memory.get("chat_ids", []):
+            memory.setdefault("chat_ids", []).append(str(CHAT_ID))
+            memory_changed = True
+            
+        # Fallback for Admin ID if not strictly provided in secrets
+        current_admin = ADMIN_CHAT_ID if ADMIN_CHAT_ID else (memory["chat_ids"][0] if memory["chat_ids"] else None)
+
+        # 2. RUN CONCURRENT SCANS
         results = await asyncio.gather(
             scan_moodle(memory, notifications, session),
             scan_timetable(memory, notifications, session),
@@ -345,7 +399,7 @@ async def main():
         any_updates = moodle_updated or timetable_updated or deadlines_updated
         all_servers_ok = moodle_ok and timetable_ok and deadlines_ok
         
-        # THE "STRIKE TWO" LOGIC
+        # 3. THE "STRIKE TWO" LOGIC (Strictly to Admin)
         if not all_servers_ok:
             current_status = memory.get("server_status", "ok")
             if current_status == "ok":
@@ -353,7 +407,8 @@ async def main():
                 memory["server_status"] = "warning"
                 memory_changed = True
             elif current_status == "warning":
-                await send_telegram(session, "🚨 <b>SCAN FAILED</b>\nCould not connect to the university servers for two consecutive scans. I will stay silent until the connection is restored.", target_chat=ADMIN_CHAT_ID)
+                if current_admin:
+                    await send_telegram(session, "🚨 <b>SYSTEM ALERT</b>\nCould not connect to the university servers for two consecutive scans. I will stay silent until the connection is restored.", target_chat=current_admin)
                 print("❌ Servers down (Strike 2). Sent failure alert to admin.")
                 memory["server_status"] = "failed"
                 memory_changed = True
@@ -363,14 +418,14 @@ async def main():
         elif all_servers_ok:
             current_status = memory.get("server_status", "ok")
             if current_status in ["failed", "warning"]:
-                if current_status == "failed":
-                    await send_telegram(session, "✅ <b>CONNECTION RESTORED</b>\nThe university servers are back online.", target_chat=ADMIN_CHAT_ID)
+                if current_status == "failed" and current_admin:
+                    await send_telegram(session, "✅ <b>CONNECTION RESTORED</b>\nThe university servers are back online.", target_chat=current_admin)
                 memory["server_status"] = "ok"
                 memory_changed = True
                 print("✅ Servers recovered.")
                 
+            # 4. BROADCAST NOTIFICATIONS TO EVERYONE
             if notifications:
-                # Smart Splitting: Guarantees links and HTML tags never get cut in half
                 messages_to_send = []
                 current_msg = "<b>🔔 Moodle Monitor Updates</b>\n\n"
                 separator = "\n\n〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n\n"
@@ -385,12 +440,15 @@ async def main():
                 
                 messages_to_send.append(current_msg)
 
+                # Loop through every harvested chat ID and send the updates
                 for msg in messages_to_send:
-                    await send_telegram(session, msg)
+                    for target_chat in memory.get("chat_ids", []):
+                        await send_telegram(session, msg, target_chat)
                 
                 memory_changed = True
-                print(f"✅ Sent {len(notifications)} updates!")
+                print(f"✅ Broadcasted {len(notifications)} updates to {len(memory.get('chat_ids', []))} chats!")
 
+        # 5. SAVE STATE
         if memory_changed or any_updates:
             await save_memory(session, memory)
             print("☁️ Memory changes detected. Saved to JSONBin.")
