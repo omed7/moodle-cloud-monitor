@@ -7,7 +7,8 @@ import datetime
 import json
 from bs4 import BeautifulSoup
 
-__version__ = "2.2.2" # The Deadline Deletion Patch
+__version__ = "2.2.3" # The Complete Deletion Radar
+
 
 
 # ==========================================
@@ -291,7 +292,7 @@ async def scan_timetable(memory, notifications, session):
     except Exception: return False, False
 
 # ==========================================
-# 7. GLOBAL MOODLE SCANNER (PATCHED)
+# 7. GLOBAL MOODLE SCANNER (DELETION PATCHED)
 # ==========================================
 def format_file_name(mod_name, mod_type):
     name_lower = mod_name.lower()
@@ -341,11 +342,15 @@ async def scan_moodle(memory, notifications, session):
                     "moodlewsrestformat": "json", "courseid": course_id
                 }, return_json=True)
                 
+                fetched_mod_ids = set()
+
                 if isinstance(content_data, list):
                     for section in content_data:
                         section_name = safe_html(section.get("name", "General Topic"))
                         for mod in section.get("modules", []):
                             mod_id = str(mod.get("id"))
+                            fetched_mod_ids.add(mod_id)
+                            
                             mod_name = mod.get("name", "Unknown File")
                             mod_type = mod.get("modname", "resource")
                             
@@ -365,26 +370,42 @@ async def scan_moodle(memory, notifications, session):
                                 else:
                                     html_link = f"\n🌐 <a href='{fileurl}'>Tap to Open Link</a>"
 
-                            old_modified = memory["files"][course_id].get(mod_id)
+                            old_data = memory["files"][course_id].get(mod_id)
+                            
+                            # Safely handle both the old integer format and the new dictionary format
+                            old_time = old_data.get("time", 0) if isinstance(old_data, dict) else (old_data if old_data is not None else None)
                             formatted_name = safe_html(format_file_name(mod_name, mod_type))
                             
-                            if mod_id not in memory["files"][course_id]:
-                                memory["files"][course_id][mod_id] = time_modified
+                            if old_time is None:
+                                memory["files"][course_id][mod_id] = {"time": time_modified, "name": formatted_name}
                                 updates_found = True
                                 notifications.append(f"📢 <b>NEW CONTENT:</b> {course_name}\n📂 Topic: {section_name}\n{formatted_name}{html_link}")
                                 
-                            elif time_modified != old_modified:
-                                memory["files"][course_id][mod_id] = time_modified
+                            elif time_modified != old_time:
+                                memory["files"][course_id][mod_id] = {"time": time_modified, "name": formatted_name}
                                 updates_found = True
                                 date_str = format_iraq_time(time_modified)
                                 notifications.append(f"🔄 <b>FILE UPDATED:</b> {course_name}\n📂 Topic: {section_name}\n{formatted_name}{date_str}{html_link}")
-                                
+
+                    # Cross-reference to find DELETED files
+                    missing_files = []
+                    for old_mod_id, old_mod_data in list(memory["files"][course_id].items()):
+                        if old_mod_id not in fetched_mod_ids:
+                            fname = old_mod_data.get("name", "Unknown File") if isinstance(old_mod_data, dict) else "Unknown File"
+                            missing_files.append((old_mod_id, fname))
+
+                    for missing_id, missing_name in missing_files:
+                        notifications.append(f"🗑️ <b>FILE REMOVED:</b> {course_name}\n{missing_name}\n✅ The professor has deleted this file.")
+                        del memory["files"][course_id][missing_id]
+                        updates_found = True
+
             except Exception: pass
         return updates_found, True
     except Exception: return False, False
 
+
 # ==========================================
-# 8. MULTI-TENANT PRIVATE GRADES
+# 8. MULTI-TENANT PRIVATE GRADES (DELETION PATCHED)
 # ==========================================
 async def scan_private_grades(memory, session, users_list):
     print("🎓 Scanning Private Grades for registered users...")
@@ -433,13 +454,17 @@ async def scan_private_grades(memory, session, users_list):
                     "moodlewsrestformat": "json", "courseid": course_id, "userid": user_id
                 }, return_json=True)
                 
+                fetched_grade_items = set()
+
                 if isinstance(grade_data, dict) and "usergrades" in grade_data and len(grade_data["usergrades"]) > 0:
                     for item in grade_data["usergrades"][0].get("gradeitems", []):
                         item_name = safe_html(item.get("itemname"))
                         grade_val = safe_html(item.get("gradeformatted", "-"))
                         if not item_name or grade_val == "-": continue
                         
+                        fetched_grade_items.add(item_name)
                         old_grade = memory["private_grades"][u_name][course_id].get(item_name)
+                        
                         if old_grade != grade_val:
                             memory["private_grades"][u_name][course_id][item_name] = grade_val
                             updates_found = True
@@ -451,6 +476,20 @@ async def scan_private_grades(memory, session, users_list):
                             
                             print(f"Sending private grade to {u_name}")
                             await send_telegram(session, msg, u_chat)
+
+                    # Cross-reference to find DELETED grades
+                    missing_grades = []
+                    for old_item_name in list(memory["private_grades"][u_name][course_id].keys()):
+                        if old_item_name not in fetched_grade_items:
+                            missing_grades.append(old_item_name)
+
+                    for missing_name in missing_grades:
+                        del_msg = f"🗑️ <b>GRADE REMOVED:</b> {course_name}\n📝 {missing_name}\n✅ The professor has deleted this grade from the portal."
+                        print(f"Sending private grade deletion to {u_name}")
+                        await send_telegram(session, del_msg, u_chat)
+                        del memory["private_grades"][u_name][course_id][missing_name]
+                        updates_found = True
+
         except Exception as e:
             print(f"⚠️ Failed grade check for {u_name}: {e}")
             servers_ok = False
