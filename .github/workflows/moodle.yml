@@ -28,4 +28,5 @@ jobs:
           MOODLE_API_URL: ${{ secrets.MOODLE_API_URL }}
           JSONBIN_ID: ${{ secrets.JSONBIN_ID }}
           JSONBIN_KEY: ${{ secrets.JSONBIN_KEY }}
+          USERS_CONFIG: ${{ secrets.USERS_CONFIG }}
         run: python goldilocks.py
