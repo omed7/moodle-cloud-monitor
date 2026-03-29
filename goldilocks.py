@@ -503,7 +503,7 @@ async def scan_private_grades(memory, session, users_list):
 async def main():
     print(f"🚀 Booting Cloud Monitor v{__version__}...")
     
-    connector = aiohttp.TCPConnector(family=socket.AF_INET) # SSL Verified natively
+        connector = aiohttp.TCPConnector(ssl=False, family=socket.AF_INET)
     async with aiohttp.ClientSession(connector=connector) as session:
         memory = await load_memory(session)
         notifications = [] 
