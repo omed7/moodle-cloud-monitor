@@ -7,14 +7,11 @@ import datetime
 import json
 from bs4 import BeautifulSoup
 
-__version__ = "2.2.3" # The Complete Deletion Radar
-
-
+__version__ = "2.2.4" # The Diagnostics Update
 
 # ==========================================
 # 1. SETUP & CONFIGURATION
 # ==========================================
-# Pull from environment, fallback to defaults if missing
 ignore_courses_env = os.environ.get("IGNORE_COURSES", "195,196,197,198,199,200,201")
 IGNORE_COURSES = [c.strip() for c in ignore_courses_env.split(",") if c.strip()]
 
@@ -41,7 +38,7 @@ def safe_html(text):
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 # ==========================================
-# 2. NETWORK HELPER (SSL SECURED)
+# 2. NETWORK HELPER
 # ==========================================
 async def fetch_data(session, url, is_moodle=False, post_data=None, return_json=True):
     headers = {}
@@ -131,8 +128,6 @@ async def load_memory(session):
                     if key not in memory: memory[key] = default_memory[key]
                 
                 current_time = int(time.time())
-                
-                # Clean up expired deadlines (supports both old integer format and new dictionary format)
                 active_deadlines = {}
                 for eid, event_data in memory["deadlines"].items():
                     ts = event_data.get("timestamp", 0) if isinstance(event_data, dict) else event_data
@@ -141,7 +136,8 @@ async def load_memory(session):
                 
                 memory["deadlines"] = active_deadlines
                 return memory
-    except Exception: pass
+    except Exception as e:
+        print(f"⚠️ Cloud Memory Load Error: {e}")
     return default_memory
 
 async def save_memory(session, memory):
@@ -150,11 +146,11 @@ async def save_memory(session, memory):
     headers = {"X-Master-Key": JSONBIN_KEY, "Content-Type": "application/json"}
     try:
         await session.put(url, json=memory, headers=headers, timeout=10)
-    except Exception: pass
-
+    except Exception as e: 
+        print(f"⚠️ Cloud Memory Save Error: {e}")
 
 # ==========================================
-# 5. DEADLINE RADAR (DELETION PATCHED)
+# 5. DEADLINE RADAR 
 # ==========================================
 async def scan_deadlines(memory, notifications, session):
     print("⏳ Scanning Deadlines...")
@@ -166,62 +162,54 @@ async def scan_deadlines(memory, notifications, session):
             "moodlewsrestformat": "json", "timesortfrom": current_time
         }
         data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data=post_data, return_json=True)
-        if isinstance(data, dict) and "exception" in data: return False, False
+        
+        # LOG THE ERROR
+        if isinstance(data, dict) and "exception" in data: 
+            print(f"🛑 Deadline API Rejected: {data}")
+            return False, False
         
         if isinstance(data, dict) and "events" in data:
             fetched_event_ids = set()
-            
-            # 1. Process all incoming events from Moodle
             for event in data["events"]:
                 event_id = str(event.get("id"))
                 fetched_event_ids.add(event_id)
-                
                 event_name = safe_html(event.get("name", "Unknown Assignment"))
                 course_name = safe_html(event.get("course", {}).get("fullname", "Unknown Course"))
                 timestamp = event.get("timesort")
-                
                 old_data = memory["deadlines"].get(event_id)
                 old_timestamp = old_data.get("timestamp") if isinstance(old_data, dict) else old_data
                 
-                # Check for new or modified deadlines
                 if old_timestamp != timestamp:
                     updates_found = True
                     dt = datetime.datetime.utcfromtimestamp(timestamp) + datetime.timedelta(hours=3)
                     date_str = dt.strftime("%A, %b %d at %I:%M %p")
-                    
                     if old_timestamp is None:
                         notifications.append(f"🚨 <b>UPCOMING DEADLINE</b>\n📚 {course_name}\n📝 {event_name}\n⏰ Due: {date_str}")
                     else:
                         notifications.append(f"⚠️ <b>DEADLINE CHANGED</b>\n📚 {course_name}\n📝 {event_name}\n⏰ New Date: {date_str}")
-                    
-                    # Save the new dictionary format
                     memory["deadlines"][event_id] = {"timestamp": timestamp, "name": event_name, "course": course_name}
-                
-                # Upgrade old integer memory to the new dictionary format silently
                 elif not isinstance(old_data, dict):
                     memory["deadlines"][event_id] = {"timestamp": timestamp, "name": event_name, "course": course_name}
                     updates_found = True
 
-            # 2. Cross-reference to find CANCELED events
             missing_events = []
             for event_id, event_data in list(memory["deadlines"].items()):
                 if event_id not in fetched_event_ids:
                     ts = event_data.get("timestamp", 0) if isinstance(event_data, dict) else event_data
                     name = event_data.get("name", "Unknown Assignment") if isinstance(event_data, dict) else "Unknown Assignment"
                     course = event_data.get("course", "Unknown Course") if isinstance(event_data, dict) else "Unknown Course"
-                    
-                    # If the deadline is still in the future, but Moodle didn't send it, it was deleted!
                     if ts > current_time:
                         missing_events.append((event_id, course, name))
                         
-            # Broadcast the cancellations and wipe them from memory
             for event_id, course, name in missing_events:
                 notifications.append(f"🗑️ <b>DEADLINE CANCELED</b>\n📚 {course}\n📝 {name}\n✅ The professor has removed this requirement.")
                 del memory["deadlines"][event_id]
                 updates_found = True
 
         return updates_found, True
-    except Exception: return False, False
+    except Exception as e: 
+        print(f"🚨 Deadline Scan Crash: {e}")
+        return False, False
 
 # ==========================================
 # 6. TIMETABLE SCANNER
@@ -289,10 +277,12 @@ async def scan_timetable(memory, notifications, session):
                     else:
                         notifications.append(f"⚠️ <b>TIMETABLE CHANGED</b>\n📆 Day: {day}\n⏰ Time: {time_str}\n❌ Old: {old_c}\n✅ New: {new_c}")
         return updates_found, True
-    except Exception: return False, False
+    except Exception as e: 
+        print(f"🚨 Timetable Scan Crash: {e}")
+        return False, False
 
 # ==========================================
-# 7. GLOBAL MOODLE SCANNER (DELETION PATCHED)
+# 7. GLOBAL MOODLE SCANNER 
 # ==========================================
 def format_file_name(mod_name, mod_type):
     name_lower = mod_name.lower()
@@ -317,7 +307,12 @@ async def scan_moodle(memory, notifications, session):
         user_data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
             "wstoken": API_TOKEN, "wsfunction": "core_webservice_get_site_info", "moodlewsrestformat": "json"
         }, return_json=True)
-        if not user_data or "exception" in user_data: return False, False
+        
+        # LOG THE ERROR
+        if not user_data or "exception" in user_data: 
+            print(f"🛑 Global Moodle Token Rejected: {user_data}")
+            return False, False
+            
         user_id = user_data.get("userid")
         if not user_id: return False, False
 
@@ -371,8 +366,6 @@ async def scan_moodle(memory, notifications, session):
                                     html_link = f"\n🌐 <a href='{fileurl}'>Tap to Open Link</a>"
 
                             old_data = memory["files"][course_id].get(mod_id)
-                            
-                            # Safely handle both the old integer format and the new dictionary format
                             old_time = old_data.get("time", 0) if isinstance(old_data, dict) else (old_data if old_data is not None else None)
                             formatted_name = safe_html(format_file_name(mod_name, mod_type))
                             
@@ -387,7 +380,6 @@ async def scan_moodle(memory, notifications, session):
                                 date_str = format_iraq_time(time_modified)
                                 notifications.append(f"🔄 <b>FILE UPDATED:</b> {course_name}\n📂 Topic: {section_name}\n{formatted_name}{date_str}{html_link}")
 
-                    # Cross-reference to find DELETED files
                     missing_files = []
                     for old_mod_id, old_mod_data in list(memory["files"][course_id].items()):
                         if old_mod_id not in fetched_mod_ids:
@@ -399,13 +391,16 @@ async def scan_moodle(memory, notifications, session):
                         del memory["files"][course_id][missing_id]
                         updates_found = True
 
-            except Exception: pass
+            except Exception as e:
+                print(f"⚠️ Internal File Sync Error for course {course_id}: {e}")
+                
         return updates_found, True
-    except Exception: return False, False
-
+    except Exception as e: 
+        print(f"🚨 Global Moodle Scan Crash: {e}")
+        return False, False
 
 # ==========================================
-# 8. MULTI-TENANT PRIVATE GRADES (DELETION PATCHED)
+# 8. MULTI-TENANT PRIVATE GRADES 
 # ==========================================
 async def scan_private_grades(memory, session, users_list):
     print("🎓 Scanning Private Grades for registered users...")
@@ -426,7 +421,10 @@ async def scan_private_grades(memory, session, users_list):
             user_data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
                 "wstoken": u_token, "wsfunction": "core_webservice_get_site_info", "moodlewsrestformat": "json"
             }, return_json=True)
+            
+            # LOG THE ERROR
             if not user_data or "exception" in user_data: 
+                print(f"🛑 Grades Token Rejected for {u_name}: {user_data}")
                 servers_ok = False
                 continue
                 
@@ -437,6 +435,7 @@ async def scan_private_grades(memory, session, users_list):
                 "wstoken": u_token, "wsfunction": "core_enrol_get_users_courses", 
                 "moodlewsrestformat": "json", "userid": user_id
             }, return_json=True)
+            
             if not isinstance(courses, list): 
                 servers_ok = False
                 continue
@@ -477,7 +476,6 @@ async def scan_private_grades(memory, session, users_list):
                             print(f"Sending private grade to {u_name}")
                             await send_telegram(session, msg, u_chat)
 
-                    # Cross-reference to find DELETED grades
                     missing_grades = []
                     for old_item_name in list(memory["private_grades"][u_name][course_id].keys()):
                         if old_item_name not in fetched_grade_items:
@@ -491,15 +489,11 @@ async def scan_private_grades(memory, session, users_list):
                         updates_found = True
 
         except Exception as e:
-            print(f"⚠️ Failed grade check for {u_name}: {e}")
+            print(f"🚨 Grades Scan Crash for {u_name}: {e}")
             servers_ok = False
 
     return updates_found, servers_ok
 
-
-# ==========================================
-# 9. THE CLOUD BATCH TRIGGER
-# ==========================================
 # ==========================================
 # 9. THE CLOUD BATCH TRIGGER
 # ==========================================
@@ -511,7 +505,6 @@ async def main():
         memory = await load_memory(session)
         notifications = [] 
         memory_changed = False
-
         
         if await harvest_chat_ids(memory, session):
             memory_changed = True
