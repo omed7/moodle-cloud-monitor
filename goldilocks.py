@@ -4,9 +4,10 @@ import os
 import socket
 import time
 import datetime
+import json
 from bs4 import BeautifulSoup
 
-__version__ = "2.0.0"
+__version__ = "2.2.0" # The Multi-Tenant JSON Update
 
 
 # ==========================================
@@ -16,8 +17,8 @@ IGNORE_COURSES = ["195", "196", "197", "198", "199", "200", "201"]
 
 API_TOKEN = os.environ.get("MOODLE_API_TOKEN")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID") # Used as a fallback/initial group
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID") # For private server alerts
+CHAT_ID = os.environ.get("CHAT_ID") 
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID") 
 RAW_URL = os.environ.get("MOODLE_API_URL", "https://moodle.uod.ac")
 
 JSONBIN_ID = os.environ.get("JSONBIN_ID")
@@ -62,7 +63,7 @@ async def send_telegram(session, message, target_chat):
     }
     try:
         await fetch_data(session, TELEGRAM_URL, post_data=payload, return_json=True)
-        await asyncio.sleep(1) # Protects against Telegram spam limits during broadcasts
+        await asyncio.sleep(1) 
     except Exception:
         pass 
 
@@ -81,12 +82,10 @@ async def harvest_chat_ids(memory, session):
             for result in data.get("result", []):
                 update_id = result.get("update_id")
                 
-                # Acknowledge the update so we don't process it again
                 if update_id and update_id >= memory.get("last_update_id", 0):
                     memory["last_update_id"] = update_id
                     updates_found = True
                 
-                # Safely extract the Chat ID depending on the event type
                 chat_id = None
                 if "message" in result: 
                     chat_id = str(result["message"]["chat"]["id"])
@@ -112,8 +111,8 @@ async def harvest_chat_ids(memory, session):
 async def load_memory(session):
     print("☁️ Fetching memory from Cloud Database...")
     default_memory = {
-        "grades": {}, "files": {}, "timetable": {}, "deadlines": {}, 
-        "server_status": "ok", "chat_ids": [], "last_update_id": 0
+        "grades": {}, "private_grades": {}, "files": {}, "timetable": {}, 
+        "deadlines": {}, "server_status": "ok", "chat_ids": [], "last_update_id": 0
     }
     if not JSONBIN_ID or not JSONBIN_KEY: return default_memory
         
@@ -128,14 +127,11 @@ async def load_memory(session):
                 for key in default_memory:
                     if key not in memory: memory[key] = default_memory[key]
                 
-                # MIGRATION & LEAK FIX: Convert old lists and purge expired deadlines
                 current_time = int(time.time())
                 if isinstance(memory.get("deadlines"), list):
                     memory["deadlines"] = {str(eid): current_time + 8640000 for eid in memory["deadlines"]}
                 
-                # Delete any assignment from memory if its due date has passed
                 memory["deadlines"] = {eid: ts for eid, ts in memory["deadlines"].items() if ts > current_time}
-                
                 return memory
     except Exception: pass
     return default_memory
@@ -247,7 +243,7 @@ async def scan_timetable(memory, notifications, session):
     except Exception: return False, False
 
 # ==========================================
-# 7. MOODLE SCANNER
+# 7. GLOBAL MOODLE SCANNER (Files Only)
 # ==========================================
 def format_file_name(mod_name, mod_type):
     name_lower = mod_name.lower()
@@ -265,7 +261,7 @@ def format_iraq_time(timestamp):
     return dt.strftime("%A, %b %d, %Y at %I:%M %p")
 
 async def scan_moodle(memory, notifications, session):
-    print("🔍 Scanning Moodle...")
+    print("🔍 Scanning Moodle for Global Files...")
     updates_found = False
 
     try:
@@ -287,34 +283,11 @@ async def scan_moodle(memory, notifications, session):
             course_name = safe_html(course['fullname'])
             if course_id in IGNORE_COURSES: continue
 
-            if course_id not in memory["grades"]: memory["grades"][course_id] = {}
             if course_id not in memory["files"]: memory["files"][course_id] = {}
             elif isinstance(memory["files"][course_id], list):
                 memory["files"][course_id] = {str(mid): 0 for mid in memory["files"][course_id]}
 
-            # GRADES
-            try:
-                grade_data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
-                    "wstoken": API_TOKEN, "wsfunction": "gradereport_user_get_grade_items",
-                    "moodlewsrestformat": "json", "courseid": course_id, "userid": user_id
-                }, return_json=True)
-                if isinstance(grade_data, dict) and "usergrades" in grade_data and len(grade_data["usergrades"]) > 0:
-                    for item in grade_data["usergrades"][0].get("gradeitems", []):
-                        item_name = safe_html(item.get("itemname"))
-                        grade_val = safe_html(item.get("gradeformatted", "-"))
-                        if not item_name or grade_val == "-": continue
-                        
-                        old_grade = memory["grades"][course_id].get(item_name)
-                        if old_grade != grade_val:
-                            memory["grades"][course_id][item_name] = grade_val
-                            updates_found = True
-                            if old_grade is None:
-                                notifications.append(f"🌟 <b>NEW GRADE:</b> {course_name}\n📝 {item_name}\n✅ Score: <b>{grade_val}</b>")
-                            else:
-                                notifications.append(f"⚠️ <b>GRADE UPDATED:</b> {course_name}\n📝 {item_name}\n❌ Old: {old_grade}\n✅ New: <b>{grade_val}</b>")
-            except Exception: pass 
-
-            # FILES
+            # FILES ONLY
             try:
                 content_data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
                     "wstoken": API_TOKEN, "wsfunction": "core_course_get_contents",
@@ -364,10 +337,86 @@ async def scan_moodle(memory, notifications, session):
     except Exception: return False, False
 
 # ==========================================
-# 8. THE CLOUD BATCH TRIGGER
+# 8. MULTI-TENANT PRIVATE GRADES
+# ==========================================
+async def scan_private_grades(memory, session, users_list):
+    print("🎓 Scanning Private Grades for registered users...")
+    updates_found = False
+    servers_ok = True
+
+    if "private_grades" not in memory: memory["private_grades"] = {}
+
+    for user in users_list:
+        u_name = user.get("name")
+        u_token = user.get("token")
+        u_chat = user.get("chat_id")
+
+        if not u_token or not u_chat: continue
+        if u_name not in memory["private_grades"]: memory["private_grades"][u_name] = {}
+
+        try:
+            user_data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
+                "wstoken": u_token, "wsfunction": "core_webservice_get_site_info", "moodlewsrestformat": "json"
+            }, return_json=True)
+            if not user_data or "exception" in user_data: 
+                servers_ok = False
+                continue
+                
+            user_id = user_data.get("userid")
+            if not user_id: continue
+
+            courses = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
+                "wstoken": u_token, "wsfunction": "core_enrol_get_users_courses", 
+                "moodlewsrestformat": "json", "userid": user_id
+            }, return_json=True)
+            if not isinstance(courses, list): 
+                servers_ok = False
+                continue
+
+            for course in courses:
+                course_id = str(course['id'])
+                course_name = safe_html(course['fullname'])
+                if course_id in IGNORE_COURSES: continue
+
+                if course_id not in memory["private_grades"][u_name]: 
+                    memory["private_grades"][u_name][course_id] = {}
+
+                grade_data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
+                    "wstoken": u_token, "wsfunction": "gradereport_user_get_grade_items",
+                    "moodlewsrestformat": "json", "courseid": course_id, "userid": user_id
+                }, return_json=True)
+                
+                if isinstance(grade_data, dict) and "usergrades" in grade_data and len(grade_data["usergrades"]) > 0:
+                    for item in grade_data["usergrades"][0].get("gradeitems", []):
+                        item_name = safe_html(item.get("itemname"))
+                        grade_val = safe_html(item.get("gradeformatted", "-"))
+                        if not item_name or grade_val == "-": continue
+                        
+                        old_grade = memory["private_grades"][u_name][course_id].get(item_name)
+                        if old_grade != grade_val:
+                            memory["private_grades"][u_name][course_id][item_name] = grade_val
+                            updates_found = True
+                            
+                            # Send Direct Message immediately to this specific user
+                            if old_grade is None:
+                                msg = f"🌟 <b>NEW GRADE:</b> {course_name}\n📝 {item_name}\n✅ Score: <b>{grade_val}</b>"
+                            else:
+                                msg = f"⚠️ <b>GRADE UPDATED:</b> {course_name}\n📝 {item_name}\n❌ Old: {old_grade}\n✅ New: <b>{grade_val}</b>"
+                            
+                            print(f"Sending private grade to {u_name}")
+                            await send_telegram(session, msg, u_chat)
+        except Exception as e:
+            print(f"⚠️ Failed grade check for {u_name}: {e}")
+            servers_ok = False
+
+    return updates_found, servers_ok
+
+
+# ==========================================
+# 9. THE CLOUD BATCH TRIGGER
 # ==========================================
 async def main():
-    print("🚀 Booting Cloud Monitor...")
+    print(f"🚀 Booting Cloud Monitor v{__version__}...")
     
     connector = aiohttp.TCPConnector(ssl=False, family=socket.AF_INET)
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -379,45 +428,51 @@ async def main():
         if await harvest_chat_ids(memory, session):
             memory_changed = True
             
-        # Ensure your primary CHAT_ID from secrets is always safely in the list
         if CHAT_ID and str(CHAT_ID) not in memory.get("chat_ids", []):
             memory.setdefault("chat_ids", []).append(str(CHAT_ID))
             memory_changed = True
             
-        # --- NEW: SELF-CLEANING DEDUPLICATION ---
         if "chat_ids" in memory:
             original_count = len(memory["chat_ids"])
-            
-            # Converts all to strings, strips spaces, removes duplicates, drops "0" and empty entries
-            cleaned_ids = list(set([
-                str(cid).strip() for cid in memory["chat_ids"] 
-                if str(cid).strip() not in ["0", "", "None"]
-            ]))
-            
+            cleaned_ids = list(set([str(cid).strip() for cid in memory["chat_ids"] if str(cid).strip() not in ["0", "", "None"]]))
             if len(cleaned_ids) != original_count:
                 memory["chat_ids"] = cleaned_ids
                 memory_changed = True
-        # ----------------------------------------
 
-        # Fallback for Admin ID if not strictly provided in secrets
         current_admin = ADMIN_CHAT_ID if ADMIN_CHAT_ID else (memory.get("chat_ids", [None])[0] if memory.get("chat_ids") else None)
 
-        # 2. RUN CONCURRENT SCANS
+        # 2. BUILD THE DYNAMIC USER ROSTER
+        # Start with the Admin (You)
+        users_to_check = [{"name": "Admin", "token": API_TOKEN, "chat_id": current_admin}]
+        
+        # Dynamically inject friends from the USERS_CONFIG GitHub Secret
+        users_json = os.environ.get('USERS_CONFIG')
+        if users_json:
+            try:
+                friends_list = json.loads(users_json)
+                users_to_check.extend(friends_list)
+                print(f"👥 Successfully loaded {len(friends_list)} friends from USERS_CONFIG.")
+            except Exception as e:
+                print(f"⚠️ JSON Format Error in USERS_CONFIG. Check your GitHub Secret syntax: {e}")
+
+        # 3. RUN CONCURRENT SCANS
         results = await asyncio.gather(
             scan_moodle(memory, notifications, session),
             scan_timetable(memory, notifications, session),
             scan_deadlines(memory, notifications, session),
+            scan_private_grades(memory, session, users_to_check),
             return_exceptions=True
         )
         
         moodle_updated, moodle_ok = results[0] if isinstance(results[0], tuple) else (False, False)
         timetable_updated, timetable_ok = results[1] if isinstance(results[1], tuple) else (False, False)
         deadlines_updated, deadlines_ok = results[2] if isinstance(results[2], tuple) else (False, False)
+        grades_updated, grades_ok = results[3] if isinstance(results[3], tuple) else (False, False)
 
-        any_updates = moodle_updated or timetable_updated or deadlines_updated
-        all_servers_ok = moodle_ok and timetable_ok and deadlines_ok
+        any_updates = moodle_updated or timetable_updated or deadlines_updated or grades_updated
+        all_servers_ok = moodle_ok and timetable_ok and deadlines_ok and grades_ok
         
-        # 3. THE "STRIKE TWO" LOGIC (Strictly to Admin)
+        # 4. THE "STRIKE TWO" LOGIC (Strictly to Admin)
         if not all_servers_ok:
             current_status = memory.get("server_status", "ok")
             if current_status == "ok":
@@ -442,23 +497,22 @@ async def main():
                 memory_changed = True
                 print("✅ Servers recovered.")
                 
-            # 4. BROADCAST NOTIFICATIONS TO EVERYONE
+            # 5. BROADCAST NOTIFICATIONS TO EVERYONE (Files, Timetable, Deadlines)
             if notifications:
                 messages_to_send = []
-                current_msg = "<b>🔔 Moodle Monitor Updates</b>\n\n"
+                current_msg = f"🤖 <b>Moodle Monitor v{__version__}</b>\n\n"
                 separator = "\n\n〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n\n"
 
                 for notif in notifications:
                     if len(current_msg) + len(notif) + len(separator) > 3900:
                         messages_to_send.append(current_msg)
-                        current_msg = "<b>🔔 Moodle Monitor Updates (Cont.)</b>\n\n" + notif
+                        current_msg = f"🤖 <b>Moodle Monitor v{__version__} (Cont.)</b>\n\n" + notif
                     else:
                         if current_msg.endswith("\n\n"): current_msg += notif
                         else: current_msg += separator + notif
                 
                 messages_to_send.append(current_msg)
 
-                # Loop through every cleanly harvested chat ID and send the updates once
                 for msg in messages_to_send:
                     for target_chat in memory.get("chat_ids", []):
                         await send_telegram(session, msg, target_chat)
@@ -466,7 +520,7 @@ async def main():
                 memory_changed = True
                 print(f"✅ Broadcasted {len(notifications)} updates to {len(memory.get('chat_ids', []))} unique chats!")
 
-        # 5. SAVE STATE
+        # 6. SAVE STATE
         if memory_changed or any_updates:
             await save_memory(session, memory)
             print("☁️ Memory changes detected. Saved to JSONBin.")
