@@ -7,13 +7,17 @@ import datetime
 import json
 from bs4 import BeautifulSoup
 
-__version__ = "2.2.0" # The Multi-Tenant JSON Update
+__version__ = "2.2.2" # The Deadline Deletion Patch
 
 
 # ==========================================
 # 1. SETUP & CONFIGURATION
 # ==========================================
-IGNORE_COURSES = ["195", "196", "197", "198", "199", "200", "201"]
+# Pull from environment, fallback to defaults if missing
+ignore_courses_env = os.environ.get("IGNORE_COURSES", "195,196,197,198,199,200,201")
+IGNORE_COURSES = [c.strip() for c in ignore_courses_env.split(",") if c.strip()]
+
+TIMETABLE_URL = os.environ.get("TIMETABLE_URL", "https://tb.duhokcihan.edu.krd/departtimtable.php?departmentNo=11&ClassNo1=1&GroupNo1=1")
 
 API_TOKEN = os.environ.get("MOODLE_API_TOKEN")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -23,8 +27,6 @@ RAW_URL = os.environ.get("MOODLE_API_URL", "https://moodle.uod.ac")
 
 JSONBIN_ID = os.environ.get("JSONBIN_ID")
 JSONBIN_KEY = os.environ.get("JSONBIN_KEY")
-
-TIMETABLE_URL = "https://tb.duhokcihan.edu.krd/departtimtable.php?departmentNo=11&ClassNo1=1&GroupNo1=1"
 
 if RAW_URL and not RAW_URL.endswith('/webservice/rest/server.php'):
     MOODLE_URL = RAW_URL.rstrip('/') + '/webservice/rest/server.php'
@@ -38,7 +40,7 @@ def safe_html(text):
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 # ==========================================
-# 2. NETWORK HELPER
+# 2. NETWORK HELPER (SSL SECURED)
 # ==========================================
 async def fetch_data(session, url, is_moodle=False, post_data=None, return_json=True):
     headers = {}
@@ -106,7 +108,7 @@ async def harvest_chat_ids(memory, session):
     return updates_found
 
 # ==========================================
-# 4. CLOUD MEMORY MANAGEMENT (JSONBIN)
+# 4. CLOUD MEMORY MANAGEMENT
 # ==========================================
 async def load_memory(session):
     print("☁️ Fetching memory from Cloud Database...")
@@ -128,10 +130,15 @@ async def load_memory(session):
                     if key not in memory: memory[key] = default_memory[key]
                 
                 current_time = int(time.time())
-                if isinstance(memory.get("deadlines"), list):
-                    memory["deadlines"] = {str(eid): current_time + 8640000 for eid in memory["deadlines"]}
                 
-                memory["deadlines"] = {eid: ts for eid, ts in memory["deadlines"].items() if ts > current_time}
+                # Clean up expired deadlines (supports both old integer format and new dictionary format)
+                active_deadlines = {}
+                for eid, event_data in memory["deadlines"].items():
+                    ts = event_data.get("timestamp", 0) if isinstance(event_data, dict) else event_data
+                    if ts > current_time:
+                        active_deadlines[eid] = event_data
+                
+                memory["deadlines"] = active_deadlines
                 return memory
     except Exception: pass
     return default_memory
@@ -144,33 +151,74 @@ async def save_memory(session, memory):
         await session.put(url, json=memory, headers=headers, timeout=10)
     except Exception: pass
 
+
 # ==========================================
-# 5. DEADLINE RADAR
+# 5. DEADLINE RADAR (DELETION PATCHED)
 # ==========================================
 async def scan_deadlines(memory, notifications, session):
     print("⏳ Scanning Deadlines...")
     updates_found = False
     try:
+        current_time = int(time.time())
         post_data = {
             "wstoken": API_TOKEN, "wsfunction": "core_calendar_get_action_events_by_timesort", 
-            "moodlewsrestformat": "json", "timesortfrom": int(time.time())
+            "moodlewsrestformat": "json", "timesortfrom": current_time
         }
         data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data=post_data, return_json=True)
         if isinstance(data, dict) and "exception" in data: return False, False
         
         if isinstance(data, dict) and "events" in data:
+            fetched_event_ids = set()
+            
+            # 1. Process all incoming events from Moodle
             for event in data["events"]:
                 event_id = str(event.get("id"))
+                fetched_event_ids.add(event_id)
+                
                 event_name = safe_html(event.get("name", "Unknown Assignment"))
                 course_name = safe_html(event.get("course", {}).get("fullname", "Unknown Course"))
                 timestamp = event.get("timesort")
                 
-                if event_id not in memory["deadlines"]:
-                    memory["deadlines"][event_id] = timestamp
+                old_data = memory["deadlines"].get(event_id)
+                old_timestamp = old_data.get("timestamp") if isinstance(old_data, dict) else old_data
+                
+                # Check for new or modified deadlines
+                if old_timestamp != timestamp:
                     updates_found = True
                     dt = datetime.datetime.utcfromtimestamp(timestamp) + datetime.timedelta(hours=3)
                     date_str = dt.strftime("%A, %b %d at %I:%M %p")
-                    notifications.append(f"🚨 <b>UPCOMING DEADLINE</b>\n📚 {course_name}\n📝 {event_name}\n⏰ Due: {date_str}")
+                    
+                    if old_timestamp is None:
+                        notifications.append(f"🚨 <b>UPCOMING DEADLINE</b>\n📚 {course_name}\n📝 {event_name}\n⏰ Due: {date_str}")
+                    else:
+                        notifications.append(f"⚠️ <b>DEADLINE CHANGED</b>\n📚 {course_name}\n📝 {event_name}\n⏰ New Date: {date_str}")
+                    
+                    # Save the new dictionary format
+                    memory["deadlines"][event_id] = {"timestamp": timestamp, "name": event_name, "course": course_name}
+                
+                # Upgrade old integer memory to the new dictionary format silently
+                elif not isinstance(old_data, dict):
+                    memory["deadlines"][event_id] = {"timestamp": timestamp, "name": event_name, "course": course_name}
+                    updates_found = True
+
+            # 2. Cross-reference to find CANCELED events
+            missing_events = []
+            for event_id, event_data in list(memory["deadlines"].items()):
+                if event_id not in fetched_event_ids:
+                    ts = event_data.get("timestamp", 0) if isinstance(event_data, dict) else event_data
+                    name = event_data.get("name", "Unknown Assignment") if isinstance(event_data, dict) else "Unknown Assignment"
+                    course = event_data.get("course", "Unknown Course") if isinstance(event_data, dict) else "Unknown Course"
+                    
+                    # If the deadline is still in the future, but Moodle didn't send it, it was deleted!
+                    if ts > current_time:
+                        missing_events.append((event_id, course, name))
+                        
+            # Broadcast the cancellations and wipe them from memory
+            for event_id, course, name in missing_events:
+                notifications.append(f"🗑️ <b>DEADLINE CANCELED</b>\n📚 {course}\n📝 {name}\n✅ The professor has removed this requirement.")
+                del memory["deadlines"][event_id]
+                updates_found = True
+
         return updates_found, True
     except Exception: return False, False
 
@@ -243,7 +291,7 @@ async def scan_timetable(memory, notifications, session):
     except Exception: return False, False
 
 # ==========================================
-# 7. GLOBAL MOODLE SCANNER (Files Only)
+# 7. GLOBAL MOODLE SCANNER (PATCHED)
 # ==========================================
 def format_file_name(mod_name, mod_type):
     name_lower = mod_name.lower()
@@ -256,9 +304,9 @@ def format_file_name(mod_name, mod_type):
     return f"📄 File: {mod_name}"
 
 def format_iraq_time(timestamp):
-    if not timestamp: return ""
+    if not timestamp or timestamp == 0: return ""
     dt = datetime.datetime.utcfromtimestamp(timestamp) + datetime.timedelta(hours=3)
-    return dt.strftime("%A, %b %d, %Y at %I:%M %p")
+    return f"\n⏳ Modified: {dt.strftime('%A, %b %d, %Y at %I:%M %p')}"
 
 async def scan_moodle(memory, notifications, session):
     print("🔍 Scanning Moodle for Global Files...")
@@ -287,7 +335,6 @@ async def scan_moodle(memory, notifications, session):
             elif isinstance(memory["files"][course_id], list):
                 memory["files"][course_id] = {str(mid): 0 for mid in memory["files"][course_id]}
 
-            # FILES ONLY
             try:
                 content_data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
                     "wstoken": API_TOKEN, "wsfunction": "core_course_get_contents",
@@ -321,15 +368,15 @@ async def scan_moodle(memory, notifications, session):
                             old_modified = memory["files"][course_id].get(mod_id)
                             formatted_name = safe_html(format_file_name(mod_name, mod_type))
                             
-                            if old_modified is None:
+                            if mod_id not in memory["files"][course_id]:
                                 memory["files"][course_id][mod_id] = time_modified
                                 updates_found = True
                                 notifications.append(f"📢 <b>NEW CONTENT:</b> {course_name}\n📂 Topic: {section_name}\n{formatted_name}{html_link}")
                                 
-                            elif time_modified > 0 and old_modified != 0 and time_modified > old_modified:
+                            elif time_modified != old_modified:
                                 memory["files"][course_id][mod_id] = time_modified
                                 updates_found = True
-                                date_str = f"\n⏳ Modified: {format_iraq_time(time_modified)}"
+                                date_str = format_iraq_time(time_modified)
                                 notifications.append(f"🔄 <b>FILE UPDATED:</b> {course_name}\n📂 Topic: {section_name}\n{formatted_name}{date_str}{html_link}")
                                 
             except Exception: pass
@@ -397,7 +444,6 @@ async def scan_private_grades(memory, session, users_list):
                             memory["private_grades"][u_name][course_id][item_name] = grade_val
                             updates_found = True
                             
-                            # Send Direct Message immediately to this specific user
                             if old_grade is None:
                                 msg = f"🌟 <b>NEW GRADE:</b> {course_name}\n📝 {item_name}\n✅ Score: <b>{grade_val}</b>"
                             else:
@@ -418,13 +464,12 @@ async def scan_private_grades(memory, session, users_list):
 async def main():
     print(f"🚀 Booting Cloud Monitor v{__version__}...")
     
-    connector = aiohttp.TCPConnector(ssl=False, family=socket.AF_INET)
+    connector = aiohttp.TCPConnector(family=socket.AF_INET) # SSL Verified natively
     async with aiohttp.ClientSession(connector=connector) as session:
         memory = await load_memory(session)
         notifications = [] 
         memory_changed = False
         
-        # 1. HARVEST NEW CHAT IDs BEFORE SCANNING
         if await harvest_chat_ids(memory, session):
             memory_changed = True
             
@@ -441,11 +486,8 @@ async def main():
 
         current_admin = ADMIN_CHAT_ID if ADMIN_CHAT_ID else (memory.get("chat_ids", [None])[0] if memory.get("chat_ids") else None)
 
-        # 2. BUILD THE DYNAMIC USER ROSTER
-        # Start with the Admin (You)
         users_to_check = [{"name": "Admin", "token": API_TOKEN, "chat_id": current_admin}]
         
-        # Dynamically inject friends from the USERS_CONFIG GitHub Secret
         users_json = os.environ.get('USERS_CONFIG')
         if users_json:
             try:
@@ -455,7 +497,6 @@ async def main():
             except Exception as e:
                 print(f"⚠️ JSON Format Error in USERS_CONFIG. Check your GitHub Secret syntax: {e}")
 
-        # 3. RUN CONCURRENT SCANS
         results = await asyncio.gather(
             scan_moodle(memory, notifications, session),
             scan_timetable(memory, notifications, session),
@@ -472,7 +513,6 @@ async def main():
         any_updates = moodle_updated or timetable_updated or deadlines_updated or grades_updated
         all_servers_ok = moodle_ok and timetable_ok and deadlines_ok and grades_ok
         
-        # 4. THE "STRIKE TWO" LOGIC (Strictly to Admin)
         if not all_servers_ok:
             current_status = memory.get("server_status", "ok")
             if current_status == "ok":
@@ -497,7 +537,6 @@ async def main():
                 memory_changed = True
                 print("✅ Servers recovered.")
                 
-            # 5. BROADCAST NOTIFICATIONS TO EVERYONE (Files, Timetable, Deadlines)
             if notifications:
                 messages_to_send = []
                 current_msg = f"🤖 <b>Moodle Monitor v{__version__}</b>\n\n"
@@ -520,7 +559,6 @@ async def main():
                 memory_changed = True
                 print(f"✅ Broadcasted {len(notifications)} updates to {len(memory.get('chat_ids', []))} unique chats!")
 
-        # 6. SAVE STATE
         if memory_changed or any_updates:
             await save_memory(session, memory)
             print("☁️ Memory changes detected. Saved to JSONBin.")
