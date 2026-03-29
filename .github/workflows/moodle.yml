@@ -29,4 +29,7 @@ jobs:
           JSONBIN_ID: ${{ secrets.JSONBIN_ID }}
           JSONBIN_KEY: ${{ secrets.JSONBIN_KEY }}
           USERS_CONFIG: ${{ secrets.USERS_CONFIG }}
+          # --- NEW CONFIG VARIABLES ---
+          IGNORE_COURSES: ${{ secrets.IGNORE_COURSES }}
+          TIMETABLE_URL: ${{ secrets.TIMETABLE_URL }}
         run: python goldilocks.py
