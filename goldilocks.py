@@ -500,14 +500,18 @@ async def scan_private_grades(memory, session, users_list):
 # ==========================================
 # 9. THE CLOUD BATCH TRIGGER
 # ==========================================
+# ==========================================
+# 9. THE CLOUD BATCH TRIGGER
+# ==========================================
 async def main():
     print(f"🚀 Booting Cloud Monitor v{__version__}...")
     
-        connector = aiohttp.TCPConnector(ssl=False, family=socket.AF_INET)
+    connector = aiohttp.TCPConnector(ssl=False, family=socket.AF_INET)
     async with aiohttp.ClientSession(connector=connector) as session:
         memory = await load_memory(session)
         notifications = [] 
         memory_changed = False
+
         
         if await harvest_chat_ids(memory, session):
             memory_changed = True
