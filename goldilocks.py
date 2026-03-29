@@ -7,7 +7,7 @@ import datetime
 import json
 from bs4 import BeautifulSoup
 
-__version__ = "2.5.4" # The Multi-Tenant JSON Update
+__version__ = "2.2.0" # The Multi-Tenant JSON Update
 
 
 # ==========================================
