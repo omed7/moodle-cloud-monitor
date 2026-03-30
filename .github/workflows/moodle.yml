@@ -3,6 +3,10 @@ name: Moodle Cloud Monitor
 on:
   workflow_dispatch:
 
+# This single block fixes the Node.js warning
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   scan-moodle:
     runs-on: ubuntu-latest
@@ -29,7 +33,6 @@ jobs:
           JSONBIN_ID: ${{ secrets.JSONBIN_ID }}
           JSONBIN_KEY: ${{ secrets.JSONBIN_KEY }}
           USERS_CONFIG: ${{ secrets.USERS_CONFIG }}
-          # --- NEW CONFIG VARIABLES ---
           IGNORE_COURSES: ${{ secrets.IGNORE_COURSES }}
           TIMETABLE_URL: ${{ secrets.TIMETABLE_URL }}
         run: python goldilocks.py
