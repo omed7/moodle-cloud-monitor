@@ -8,7 +8,8 @@ import json
 import html
 from bs4 import BeautifulSoup
 
-__version__ = "2.2.5" # The Ghost Grade & Formatting Patch
+__version__ = "2.2.6" # The Stealth Assignment Radar
+
 
 # ==========================================
 # 1. SETUP & CONFIGURATION
@@ -136,7 +137,8 @@ async def load_memory(session):
                 active_deadlines = {}
                 for eid, event_data in memory["deadlines"].items():
                     ts = event_data.get("timestamp", 0) if isinstance(event_data, dict) else event_data
-                    if ts > current_time:
+                    # Keep if it's in the future OR if it's an open-ended assignment (ts == 0)
+                    if ts > current_time or ts == 0:
                         active_deadlines[eid] = event_data
                 
                 memory["deadlines"] = active_deadlines
@@ -155,31 +157,71 @@ async def save_memory(session, memory):
         print(f"⚠️ Cloud Memory Save Error: {e}")
 
 # ==========================================
-# 5. DEADLINE RADAR 
+# 5. DEADLINES & STEALTH ASSIGNMENTS 
 # ==========================================
 async def scan_deadlines(memory, notifications, session):
-    print("⏳ Scanning Deadlines...")
+    print("⏳ Scanning Assignments & Deadlines...")
     updates_found = False
+    fetched_event_ids = set()
+    current_time = int(time.time())
+
     try:
-        current_time = int(time.time())
-        post_data = {
+        # --- PART 1: THE STEALTH ASSIGNMENT RADAR ---
+        assign_data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
+            "wstoken": API_TOKEN, "wsfunction": "mod_assign_get_assignments", 
+            "moodlewsrestformat": "json"
+        }, return_json=True)
+
+        if isinstance(assign_data, dict) and "courses" in assign_data:
+            for course_obj in assign_data["courses"]:
+                course_id = str(course_obj.get("id"))
+                if course_id in IGNORE_COURSES: continue
+                
+                course_name = safe_html(course_obj.get("fullname", "Unknown Course"))
+                
+                for assign in course_obj.get("assignments", []):
+                    assign_id = "assign_" + str(assign.get("id"))
+                    fetched_event_ids.add(assign_id)
+                    
+                    event_name = safe_html(assign.get("name", "Unknown Assignment"))
+                    timestamp = assign.get("duedate", 0)
+                    
+                    old_data = memory["deadlines"].get(assign_id)
+                    old_timestamp = old_data.get("timestamp") if isinstance(old_data, dict) else old_data
+                    
+                    if old_timestamp != timestamp:
+                        updates_found = True
+                        if timestamp > 0:
+                            dt = datetime.datetime.utcfromtimestamp(timestamp) + datetime.timedelta(hours=3)
+                            date_str = dt.strftime("%A, %b %d at %I:%M %p")
+                        else:
+                            date_str = "Open-Ended (No Due Date)"
+                            
+                        if old_timestamp is None:
+                            notifications.append(f"📥 <b>NEW ASSIGNMENT</b>\n📚 {course_name}\n📝 {event_name}\n⏰ Due: {date_str}")
+                        else:
+                            notifications.append(f"⚠️ <b>DEADLINE CHANGED</b>\n📚 {course_name}\n📝 {event_name}\n⏰ New Date: {date_str}")
+                        
+                        memory["deadlines"][assign_id] = {"timestamp": timestamp, "name": event_name, "course": course_name}
+
+        # --- PART 2: THE CALENDAR RADAR (Quizzes, Exams, Meetings) ---
+        cal_data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
             "wstoken": API_TOKEN, "wsfunction": "core_calendar_get_action_events_by_timesort", 
             "moodlewsrestformat": "json", "timesortfrom": current_time
-        }
-        data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data=post_data, return_json=True)
+        }, return_json=True)
         
-        if isinstance(data, dict) and "exception" in data: 
-            print(f"🛑 Deadline API Rejected: {data}")
-            return False, False
-        
-        if isinstance(data, dict) and "events" in data:
-            fetched_event_ids = set()
-            for event in data["events"]:
-                event_id = str(event.get("id"))
+        if isinstance(cal_data, dict) and "events" in cal_data:
+            for event in cal_data["events"]:
+                # Ignore assignments here, Part 1 already handled them perfectly!
+                if event.get("modulename") == "assign": continue
+
+                event_id = "cal_" + str(event.get("id"))
                 fetched_event_ids.add(event_id)
-                event_name = safe_html(event.get("name", "Unknown Assignment"))
+                
+                event_name = safe_html(event.get("name", "Unknown Event"))
                 course_name = safe_html(event.get("course", {}).get("fullname", "Unknown Course"))
                 timestamp = event.get("timesort")
+                
                 old_data = memory["deadlines"].get(event_id)
                 old_timestamp = old_data.get("timestamp") if isinstance(old_data, dict) else old_data
                 
@@ -187,32 +229,39 @@ async def scan_deadlines(memory, notifications, session):
                     updates_found = True
                     dt = datetime.datetime.utcfromtimestamp(timestamp) + datetime.timedelta(hours=3)
                     date_str = dt.strftime("%A, %b %d at %I:%M %p")
+                    
                     if old_timestamp is None:
-                        notifications.append(f"🚨 <b>UPCOMING DEADLINE</b>\n📚 {course_name}\n📝 {event_name}\n⏰ Due: {date_str}")
+                        notifications.append(f"🚨 <b>UPCOMING EVENT</b>\n📚 {course_name}\n📝 {event_name}\n⏰ Due: {date_str}")
                     else:
-                        notifications.append(f"⚠️ <b>DEADLINE CHANGED</b>\n📚 {course_name}\n📝 {event_name}\n⏰ New Date: {date_str}")
+                        notifications.append(f"⚠️ <b>EVENT TIME CHANGED</b>\n📚 {course_name}\n📝 {event_name}\n⏰ New Date: {date_str}")
+                    
                     memory["deadlines"][event_id] = {"timestamp": timestamp, "name": event_name, "course": course_name}
-                elif not isinstance(old_data, dict):
-                    memory["deadlines"][event_id] = {"timestamp": timestamp, "name": event_name, "course": course_name}
-                    updates_found = True
 
-            missing_events = []
-            for event_id, event_data in list(memory["deadlines"].items()):
-                if event_id not in fetched_event_ids:
-                    ts = event_data.get("timestamp", 0) if isinstance(event_data, dict) else event_data
-                    name = event_data.get("name", "Unknown Assignment") if isinstance(event_data, dict) else "Unknown Assignment"
-                    course = event_data.get("course", "Unknown Course") if isinstance(event_data, dict) else "Unknown Course"
-                    if ts > current_time:
-                        missing_events.append((event_id, course, name))
-                        
-            for event_id, course, name in missing_events:
-                notifications.append(f"🗑️ <b>DEADLINE CANCELED</b>\n📚 {course}\n📝 {name}\n✅ The professor has removed this requirement.")
-                del memory["deadlines"][event_id]
-                updates_found = True
+        # --- PART 3: CROSS-REFERENCE DELETION CHECK ---
+        missing_events = []
+        for event_id, event_data in list(memory["deadlines"].items()):
+            if event_id not in fetched_event_ids:
+                # Silently delete v2.2.5 format IDs to safely upgrade the cloud memory
+                if not str(event_id).startswith("assign_") and not str(event_id).startswith("cal_"):
+                    del memory["deadlines"][event_id]
+                    updates_found = True
+                    continue
+
+                ts = event_data.get("timestamp", 0) if isinstance(event_data, dict) else event_data
+                name = event_data.get("name", "Unknown Task") if isinstance(event_data, dict) else "Unknown Task"
+                course = event_data.get("course", "Unknown Course") if isinstance(event_data, dict) else "Unknown Course"
+                
+                if ts > current_time or ts == 0:
+                    missing_events.append((event_id, course, name))
+                    
+        for event_id, course, name in missing_events:
+            notifications.append(f"🗑️ <b>TASK CANCELED</b>\n📚 {course}\n📝 {name}\n✅ The professor has removed this requirement.")
+            del memory["deadlines"][event_id]
+            updates_found = True
 
         return updates_found, True
     except Exception as e: 
-        print(f"🚨 Deadline Scan Crash: {e}")
+        print(f"🚨 Task Scan Crash: {e}")
         return False, False
 
 # ==========================================
