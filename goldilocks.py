@@ -37,7 +37,11 @@ TELEGRAM_URL = f"https://moodle-tele-proxy.fy20155.workers.dev/bot{BOT_TOKEN}/se
 TELEGRAM_UPDATES_URL = f"https://moodle-tele-proxy.fy20155.workers.dev/bot{BOT_TOKEN}/getUpdates"
 
 def safe_html(text):
-    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    if not text: return ""
+    # Unescape first to clear any Moodle double-encoding
+    clean_text = html.unescape(str(text))
+    # Re-escape for Telegram's strict requirements
+    return clean_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 # ==========================================
 # 2. NETWORK HELPER
