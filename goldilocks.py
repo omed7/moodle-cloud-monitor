@@ -8,8 +8,7 @@ import json
 import html
 from bs4 import BeautifulSoup
 
-
-__version__ = "2.2.4" # The Diagnostics Update
+__version__ = "2.2.5" # The Ghost Grade & Formatting Patch
 
 # ==========================================
 # 1. SETUP & CONFIGURATION
@@ -40,7 +39,7 @@ def safe_html(text):
     if not text: return ""
     # Unescape first to clear any Moodle double-encoding
     clean_text = html.unescape(str(text))
-    # Re-escape for Telegram's strict requirements
+    # Re-escape strictly for Telegram's HTML parser
     return clean_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 # ==========================================
@@ -169,7 +168,6 @@ async def scan_deadlines(memory, notifications, session):
         }
         data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data=post_data, return_json=True)
         
-        # LOG THE ERROR
         if isinstance(data, dict) and "exception" in data: 
             print(f"🛑 Deadline API Rejected: {data}")
             return False, False
@@ -314,7 +312,6 @@ async def scan_moodle(memory, notifications, session):
             "wstoken": API_TOKEN, "wsfunction": "core_webservice_get_site_info", "moodlewsrestformat": "json"
         }, return_json=True)
         
-        # LOG THE ERROR
         if not user_data or "exception" in user_data: 
             print(f"🛑 Global Moodle Token Rejected: {user_data}")
             return False, False
@@ -428,7 +425,6 @@ async def scan_private_grades(memory, session, users_list):
                 "wstoken": u_token, "wsfunction": "core_webservice_get_site_info", "moodlewsrestformat": "json"
             }, return_json=True)
             
-            # LOG THE ERROR
             if not user_data or "exception" in user_data: 
                 print(f"🛑 Grades Token Rejected for {u_name}: {user_data}")
                 servers_ok = False
@@ -463,9 +459,15 @@ async def scan_private_grades(memory, session, users_list):
 
                 if isinstance(grade_data, dict) and "usergrades" in grade_data and len(grade_data["usergrades"]) > 0:
                     for item in grade_data["usergrades"][0].get("gradeitems", []):
-                        item_name = safe_html(item.get("itemname"))
-                        grade_val = safe_html(item.get("gradeformatted", "-"))
-                        if not item_name or grade_val == "-": continue
+                        raw_name = item.get("itemname")
+                        raw_grade = item.get("gradeformatted")
+                        
+                        # 🚫 THE STRICT EMPTY GRADE FILTER 🚫
+                        if not raw_name or not raw_grade or str(raw_grade).strip() in ["", "-", "None"]: 
+                            continue
+                        
+                        item_name = safe_html(raw_name)
+                        grade_val = safe_html(raw_grade)
                         
                         fetched_grade_items.add(item_name)
                         old_grade = memory["private_grades"][u_name][course_id].get(item_name)
