@@ -5,7 +5,9 @@ import socket
 import time
 import datetime
 import json
+import html
 from bs4 import BeautifulSoup
+
 
 __version__ = "2.2.4" # The Diagnostics Update
 
