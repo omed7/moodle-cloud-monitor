@@ -8,7 +8,7 @@ import json
 import html
 from bs4 import BeautifulSoup
 
-__version__ = "2.2.6" # The Stealth Assignment Radar
+__version__ = "2.2.7" # The Stealth Assignment Radar
 
 
 # ==========================================
