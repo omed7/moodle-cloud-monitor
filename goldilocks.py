@@ -8,7 +8,7 @@ import json
 import html
 from bs4 import BeautifulSoup
 
-__version__ = "2.2.8" # The Hardcoded Routing Patch
+__version__ = "2.2.9" # The Strict Routing Patch
 
 # ==========================================
 # 1. SETUP & CONFIGURATION
@@ -21,7 +21,7 @@ TIMETABLE_URL = os.environ.get("TIMETABLE_URL", "https://tb.duhokcihan.edu.krd/d
 API_TOKEN = os.environ.get("MOODLE_API_TOKEN")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 
-# The v2.2.8 Comma-Separated ID Parser
+# The Comma-Separated ID Parser
 chat_id_env = os.environ.get("CHAT_ID", "")
 HARDCODED_CHAT_IDS = [cid.strip() for cid in chat_id_env.split(",") if cid.strip()]
 
@@ -37,7 +37,6 @@ else:
     MOODLE_URL = RAW_URL
 
 TELEGRAM_URL = f"https://moodle-tele-proxy.fy20155.workers.dev/bot{BOT_TOKEN}/sendMessage"
-TELEGRAM_UPDATES_URL = f"https://moodle-tele-proxy.fy20155.workers.dev/bot{BOT_TOKEN}/getUpdates"
 
 def safe_html(text):
     if not text: return ""
@@ -75,45 +74,7 @@ async def send_telegram(session, message, target_chat):
         pass 
 
 # ==========================================
-# 3. AUTO-HARVESTER
-# ==========================================
-async def harvest_chat_ids(memory, session):
-    print("📡 Harvesting new Telegram users & groups...")
-    updates_found = False
-    offset = memory.get("last_update_id", 0) + 1
-    url = f"{TELEGRAM_UPDATES_URL}?offset={offset}"
-    
-    try:
-        data = await fetch_data(session, url, return_json=True)
-        if isinstance(data, dict) and data.get("ok"):
-            for result in data.get("result", []):
-                update_id = result.get("update_id")
-                
-                if update_id and update_id >= memory.get("last_update_id", 0):
-                    memory["last_update_id"] = update_id
-                    updates_found = True
-                
-                chat_id = None
-                if "message" in result: 
-                    chat_id = str(result["message"]["chat"]["id"])
-                elif "my_chat_member" in result: 
-                    chat_id = str(result["my_chat_member"]["chat"]["id"])
-                elif "channel_post" in result: 
-                    chat_id = str(result["channel_post"]["chat"]["id"])
-                    
-                if chat_id:
-                    if "chat_ids" not in memory: memory["chat_ids"] = []
-                    if chat_id not in memory["chat_ids"]:
-                        memory["chat_ids"].append(chat_id)
-                        print(f"🆕 New destination registered: {chat_id}")
-                        updates_found = True
-    except Exception as e:
-        print(f"⚠️ Failed to harvest IDs: {e}")
-        
-    return updates_found
-
-# ==========================================
-# 4. CLOUD MEMORY MANAGEMENT
+# 3. CLOUD MEMORY MANAGEMENT
 # ==========================================
 async def load_memory(session):
     print("☁️ Fetching memory from Cloud Database...")
@@ -160,7 +121,7 @@ async def save_memory(session, memory):
         print(f"⚠️ Cloud Memory Save Error: {e}")
 
 # ==========================================
-# 5. DEADLINES & STEALTH ASSIGNMENTS 
+# 4. DEADLINES & STEALTH ASSIGNMENTS 
 # ==========================================
 async def scan_deadlines(memory, notifications, session):
     print("⏳ Scanning Assignments & Deadlines...")
@@ -263,7 +224,7 @@ async def scan_deadlines(memory, notifications, session):
         return False, False
 
 # ==========================================
-# 6. TIMETABLE SCANNER
+# 5. TIMETABLE SCANNER
 # ==========================================
 def parse_timetable(html):
     soup = BeautifulSoup(html, 'html.parser')
@@ -333,7 +294,7 @@ async def scan_timetable(memory, notifications, session):
         return False, False
 
 # ==========================================
-# 7. GLOBAL MOODLE SCANNER 
+# 6. GLOBAL MOODLE SCANNER 
 # ==========================================
 def format_file_name(mod_name, mod_type):
     name_lower = mod_name.lower()
@@ -450,7 +411,7 @@ async def scan_moodle(memory, notifications, session):
         return False, False
 
 # ==========================================
-# 8. MULTI-TENANT PRIVATE GRADES 
+# 7. MULTI-TENANT PRIVATE GRADES 
 # ==========================================
 async def scan_private_grades(memory, session, users_list):
     print("🎓 Scanning Private Grades for registered users...")
@@ -549,7 +510,7 @@ async def scan_private_grades(memory, session, users_list):
     return updates_found, servers_ok
 
 # ==========================================
-# 9. THE CLOUD BATCH TRIGGER
+# 8. THE CLOUD BATCH TRIGGER
 # ==========================================
 async def main():
     print(f"🚀 Booting Cloud Monitor v{__version__}...")
@@ -566,23 +527,13 @@ async def main():
         notifications = [] 
         memory_changed = False
         
-        if await harvest_chat_ids(memory, session):
-            memory_changed = True
-            
-        # ⚓ THE INDESTRUCTIBLE ANCHOR (v2.2.8) ⚓
-        if "chat_ids" not in memory:
-            memory["chat_ids"] = []
-            
-        for cid in HARDCODED_CHAT_IDS:
-            if cid not in memory["chat_ids"]:
-                memory["chat_ids"].append(cid)
-                memory_changed = True
-                
-        # Clean up empty or invalid IDs
-        original_count = len(memory["chat_ids"])
-        cleaned_ids = list(set([str(cid).strip() for cid in memory["chat_ids"] if str(cid).strip() not in ["0", "", "None"]]))
-        if len(cleaned_ids) != original_count:
-            memory["chat_ids"] = cleaned_ids
+        # ⚓ STRICT ROUTING (v2.2.9) ⚓
+        # Completely bypass Telegram API. Force the JSON memory to strictly match GitHub Secrets.
+        old_chat_ids = memory.get("chat_ids", [])
+        new_chat_ids = list(set([str(cid).strip() for cid in HARDCODED_CHAT_IDS if str(cid).strip() not in ["0", "", "None"]]))
+        
+        if sorted(old_chat_ids) != sorted(new_chat_ids):
+            memory["chat_ids"] = new_chat_ids
             memory_changed = True
 
         current_admin = ADMIN_CHAT_ID if ADMIN_CHAT_ID else (memory.get("chat_ids", [None])[0] if memory.get("chat_ids") else None)
