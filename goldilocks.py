@@ -8,8 +8,7 @@ import json
 import html
 from bs4 import BeautifulSoup
 
-__version__ = "2.2.7" # The Stealth Assignment Radar
-
+__version__ = "2.2.8" # The Hardcoded Routing Patch
 
 # ==========================================
 # 1. SETUP & CONFIGURATION
@@ -21,7 +20,11 @@ TIMETABLE_URL = os.environ.get("TIMETABLE_URL", "https://tb.duhokcihan.edu.krd/d
 
 API_TOKEN = os.environ.get("MOODLE_API_TOKEN")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID") 
+
+# The v2.2.8 Comma-Separated ID Parser
+chat_id_env = os.environ.get("CHAT_ID", "")
+HARDCODED_CHAT_IDS = [cid.strip() for cid in chat_id_env.split(",") if cid.strip()]
+
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID") 
 RAW_URL = os.environ.get("MOODLE_API_URL", "https://moodle.uod.ac")
 
@@ -38,9 +41,7 @@ TELEGRAM_UPDATES_URL = f"https://moodle-tele-proxy.fy20155.workers.dev/bot{BOT_T
 
 def safe_html(text):
     if not text: return ""
-    # Unescape first to clear any Moodle double-encoding
     clean_text = html.unescape(str(text))
-    # Re-escape strictly for Telegram's HTML parser
     return clean_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 # ==========================================
@@ -126,7 +127,6 @@ async def load_memory(session):
     headers = {"X-Master-Key": JSONBIN_KEY}
     
     try:
-        # Increased timeout to 20 seconds to prevent random network failures
         async with session.get(url, headers=headers, timeout=20) as resp:
             if resp.status == 200:
                 data = await resp.json()
@@ -145,10 +145,19 @@ async def load_memory(session):
                 return memory
             else:
                 print(f"⚠️ JSONBin Error {resp.status}: Refusing to load blank memory.")
-                return None # Signal a critical database failure
+                return None 
     except Exception as e:
         print(f"⚠️ Cloud Memory Load Crash: {e}")
-        return None # Signal a critical network failure
+        return None 
+
+async def save_memory(session, memory):
+    if not JSONBIN_ID or not JSONBIN_KEY: return
+    url = f"https://api.jsonbin.io/v3/b/{JSONBIN_ID}"
+    headers = {"X-Master-Key": JSONBIN_KEY, "Content-Type": "application/json"}
+    try:
+        await session.put(url, json=memory, headers=headers, timeout=10)
+    except Exception as e: 
+        print(f"⚠️ Cloud Memory Save Error: {e}")
 
 # ==========================================
 # 5. DEADLINES & STEALTH ASSIGNMENTS 
@@ -160,7 +169,6 @@ async def scan_deadlines(memory, notifications, session):
     current_time = int(time.time())
 
     try:
-        # --- PART 1: THE STEALTH ASSIGNMENT RADAR ---
         assign_data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
             "wstoken": API_TOKEN, "wsfunction": "mod_assign_get_assignments", 
             "moodlewsrestformat": "json"
@@ -198,7 +206,6 @@ async def scan_deadlines(memory, notifications, session):
                         
                         memory["deadlines"][assign_id] = {"timestamp": timestamp, "name": event_name, "course": course_name}
 
-        # --- PART 2: THE CALENDAR RADAR (Quizzes, Exams, Meetings) ---
         cal_data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
             "wstoken": API_TOKEN, "wsfunction": "core_calendar_get_action_events_by_timesort", 
             "moodlewsrestformat": "json", "timesortfrom": current_time
@@ -206,7 +213,6 @@ async def scan_deadlines(memory, notifications, session):
         
         if isinstance(cal_data, dict) and "events" in cal_data:
             for event in cal_data["events"]:
-                # Ignore assignments here, Part 1 already handled them perfectly!
                 if event.get("modulename") == "assign": continue
 
                 event_id = "cal_" + str(event.get("id"))
@@ -231,11 +237,9 @@ async def scan_deadlines(memory, notifications, session):
                     
                     memory["deadlines"][event_id] = {"timestamp": timestamp, "name": event_name, "course": course_name}
 
-        # --- PART 3: CROSS-REFERENCE DELETION CHECK ---
         missing_events = []
         for event_id, event_data in list(memory["deadlines"].items()):
             if event_id not in fetched_event_ids:
-                # Silently delete v2.2.5 format IDs to safely upgrade the cloud memory
                 if not str(event_id).startswith("assign_") and not str(event_id).startswith("cal_"):
                     del memory["deadlines"][event_id]
                     updates_found = True
@@ -505,7 +509,6 @@ async def scan_private_grades(memory, session, users_list):
                         raw_name = item.get("itemname")
                         raw_grade = item.get("gradeformatted")
                         
-                        # 🚫 THE STRICT EMPTY GRADE FILTER 🚫
                         if not raw_name or not raw_grade or str(raw_grade).strip() in ["", "-", "None"]: 
                             continue
                         
@@ -549,7 +552,7 @@ async def scan_private_grades(memory, session, users_list):
 # 9. THE CLOUD BATCH TRIGGER
 # ==========================================
 async def main():
-    print(f"🚀 Booting Cloud Monitor v2.2.7...")
+    print(f"🚀 Booting Cloud Monitor v{__version__}...")
     
     connector = aiohttp.TCPConnector(ssl=False, family=socket.AF_INET)
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -558,14 +561,110 @@ async def main():
         # 🛑 THE DATABASE LOCK 🛑
         if memory is None:
             print("❌ CRITICAL: Could not read cloud memory. Aborting run to protect database from being wiped.")
-            return # Stops the script immediately
+            return 
             
         notifications = [] 
         memory_changed = False
         
         if await harvest_chat_ids(memory, session):
             memory_changed = True
+            
+        # ⚓ THE INDESTRUCTIBLE ANCHOR (v2.2.8) ⚓
+        if "chat_ids" not in memory:
+            memory["chat_ids"] = []
+            
+        for cid in HARDCODED_CHAT_IDS:
+            if cid not in memory["chat_ids"]:
+                memory["chat_ids"].append(cid)
+                memory_changed = True
+                
+        # Clean up empty or invalid IDs
+        original_count = len(memory["chat_ids"])
+        cleaned_ids = list(set([str(cid).strip() for cid in memory["chat_ids"] if str(cid).strip() not in ["0", "", "None"]]))
+        if len(cleaned_ids) != original_count:
+            memory["chat_ids"] = cleaned_ids
+            memory_changed = True
 
+        current_admin = ADMIN_CHAT_ID if ADMIN_CHAT_ID else (memory.get("chat_ids", [None])[0] if memory.get("chat_ids") else None)
+
+        users_to_check = [{"name": "Admin", "token": API_TOKEN, "chat_id": current_admin}]
+        
+        users_json = os.environ.get('USERS_CONFIG')
+        if users_json:
+            try:
+                friends_list = json.loads(users_json)
+                users_to_check.extend(friends_list)
+                print(f"👥 Successfully loaded {len(friends_list)} friends from USERS_CONFIG.")
+            except Exception as e:
+                print(f"⚠️ JSON Format Error in USERS_CONFIG. Check your GitHub Secret syntax: {e}")
+
+        results = await asyncio.gather(
+            scan_moodle(memory, notifications, session),
+            scan_timetable(memory, notifications, session),
+            scan_deadlines(memory, notifications, session),
+            scan_private_grades(memory, session, users_to_check),
+            return_exceptions=True
+        )
+        
+        moodle_updated, moodle_ok = results[0] if isinstance(results[0], tuple) else (False, False)
+        timetable_updated, timetable_ok = results[1] if isinstance(results[1], tuple) else (False, False)
+        deadlines_updated, deadlines_ok = results[2] if isinstance(results[2], tuple) else (False, False)
+        grades_updated, grades_ok = results[3] if isinstance(results[3], tuple) else (False, False)
+
+        any_updates = moodle_updated or timetable_updated or deadlines_updated or grades_updated
+        all_servers_ok = moodle_ok and timetable_ok and deadlines_ok and grades_ok
+        
+        if not all_servers_ok:
+            current_status = memory.get("server_status", "ok")
+            if current_status == "ok":
+                print("⚠️ Servers missed a beat (Strike 1). Ignoring until next scan.")
+                memory["server_status"] = "warning"
+                memory_changed = True
+            elif current_status == "warning":
+                if current_admin:
+                    await send_telegram(session, "🚨 <b>SYSTEM ALERT</b>\nCould not connect to the university servers for two consecutive scans. I will stay silent until the connection is restored.", target_chat=current_admin)
+                print("❌ Servers down (Strike 2). Sent failure alert to admin.")
+                memory["server_status"] = "failed"
+                memory_changed = True
+            else:
+                print("❌ Servers still down. Remaining silent.")
+                
+        elif all_servers_ok:
+            current_status = memory.get("server_status", "ok")
+            if current_status in ["failed", "warning"]:
+                if current_status == "failed" and current_admin:
+                    await send_telegram(session, "✅ <b>CONNECTION RESTORED</b>\nThe university servers are back online.", target_chat=current_admin)
+                memory["server_status"] = "ok"
+                memory_changed = True
+                print("✅ Servers recovered.")
+                
+            if notifications:
+                messages_to_send = []
+                current_msg = f"🤖 <b>Moodle Monitor v{__version__}</b>\n\n"
+                separator = "\n\n〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n\n"
+
+                for notif in notifications:
+                    if len(current_msg) + len(notif) + len(separator) > 3900:
+                        messages_to_send.append(current_msg)
+                        current_msg = f"🤖 <b>Moodle Monitor v{__version__} (Cont.)</b>\n\n" + notif
+                    else:
+                        if current_msg.endswith("\n\n"): current_msg += notif
+                        else: current_msg += separator + notif
+                
+                messages_to_send.append(current_msg)
+
+                for msg in messages_to_send:
+                    for target_chat in memory.get("chat_ids", []):
+                        await send_telegram(session, msg, target_chat)
+                
+                memory_changed = True
+                print(f"✅ Broadcasted {len(notifications)} updates to {len(memory.get('chat_ids', []))} unique chats!")
+
+        if memory_changed or any_updates:
+            await save_memory(session, memory)
+            print("☁️ Memory changes detected. Saved to JSONBin.")
+        else:
+            print("🛑 Skipped saving to JSONBin (No API request wasted).")
 
 if __name__ == "__main__":
     asyncio.run(main())
