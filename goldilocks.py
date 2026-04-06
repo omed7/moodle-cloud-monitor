@@ -8,7 +8,7 @@ import json
 import html
 from bs4 import BeautifulSoup
 
-__version__ = "2.3.1" # The Network Security Patch
+__version__ = "2.3.0" # The Smart Deadlines Patch
 
 # ==========================================
 # 1. SETUP & CONFIGURATION
@@ -21,11 +21,13 @@ TIMETABLE_URL = os.environ.get("TIMETABLE_URL", "https://tb.duhokcihan.edu.krd/d
 API_TOKEN = os.environ.get("MOODLE_API_TOKEN")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 
+# The Comma-Separated ID Parser
 chat_id_env = os.environ.get("CHAT_ID", "")
 HARDCODED_CHAT_IDS = [cid.strip() for cid in chat_id_env.split(",") if cid.strip()]
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID") 
 
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID") 
 RAW_URL = os.environ.get("MOODLE_API_URL", "https://moodle.uod.ac")
+
 JSONBIN_ID = os.environ.get("JSONBIN_ID")
 JSONBIN_KEY = os.environ.get("JSONBIN_KEY")
 
@@ -42,25 +44,19 @@ def safe_html(text):
     return clean_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 # ==========================================
-# 2. NETWORK HELPER (Patched Timers & SSL)
+# 2. NETWORK HELPER
 # ==========================================
-async def fetch_data(session, url, is_moodle=False, post_data=None, return_json=True, verify_ssl=True):
+async def fetch_data(session, url, is_moodle=False, post_data=None, return_json=True):
     headers = {}
     if return_json: headers["Accept"] = "application/json"
     if is_moodle: headers["User-Agent"] = "MoodleMobile"
         
-    # Claude Fix 1: Correct aiohttp timeout format
-    req_timeout = aiohttp.ClientTimeout(total=15)
-    
-    # Claude Fix 8: Selective SSL Verification
-    ssl_context = False if not verify_ssl else None
-        
     if post_data:
-        async with session.post(url, data=post_data, headers=headers, timeout=req_timeout, ssl=ssl_context) as resp:
+        async with session.post(url, data=post_data, headers=headers, timeout=15) as resp:
             resp.raise_for_status() 
             return await resp.json() if return_json else await resp.text()
     else:
-        async with session.get(url, headers=headers, timeout=req_timeout, ssl=ssl_context) as resp:
+        async with session.get(url, headers=headers, timeout=15) as resp:
             resp.raise_for_status()
             return await resp.json() if return_json else await resp.text()
 
@@ -72,12 +68,10 @@ async def send_telegram(session, message, target_chat):
         "disable_web_page_preview": True
     }
     try:
-        # Telegram has valid SSL, so verify_ssl defaults to True
         await fetch_data(session, TELEGRAM_URL, post_data=payload, return_json=True)
         await asyncio.sleep(1) 
-    except Exception as e:
-        # Claude Fix 11: Stop swallowing exceptions silently
-        print(f"⚠️ Telegram sending failed: {e}")
+    except Exception:
+        pass 
 
 # ==========================================
 # 3. CLOUD MEMORY MANAGEMENT
@@ -94,14 +88,14 @@ async def load_memory(session):
     headers = {"X-Master-Key": JSONBIN_KEY}
     
     try:
-        # We bypass fetch_data and use session.get directly so the headers stay intact!
-        req_timeout = aiohttp.ClientTimeout(total=20)
-        async with session.get(url, headers=headers, timeout=req_timeout) as resp:
+        async with session.get(url, headers=headers, timeout=20) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 memory = data.get("record", {})
                 for key in default_memory:
                     if key not in memory: memory[key] = default_memory[key]
+                
+                # Removed the aggressive memory wipe here so Rule 4 functions properly
                 return memory
             else:
                 print(f"⚠️ JSONBin Error {resp.status}: Refusing to load blank memory.")
@@ -110,20 +104,14 @@ async def load_memory(session):
         print(f"⚠️ Cloud Memory Load Crash: {e}")
         return None 
 
-
 async def save_memory(session, memory):
     if not JSONBIN_ID or not JSONBIN_KEY: return
     url = f"https://api.jsonbin.io/v3/b/{JSONBIN_ID}"
     headers = {"X-Master-Key": JSONBIN_KEY, "Content-Type": "application/json"}
-    
-    # Claude Fix 1 & 5: Correct Timeout and Context Manager
-    req_timeout = aiohttp.ClientTimeout(total=10)
     try:
-        async with session.put(url, json=memory, headers=headers, timeout=req_timeout) as resp:
-            if resp.status != 200:
-                print(f"⚠️ Cloud Memory Save Error: HTTP {resp.status}")
+        await session.put(url, json=memory, headers=headers, timeout=10)
     except Exception as e: 
-        print(f"⚠️ Cloud Memory Save Crash: {e}")
+        print(f"⚠️ Cloud Memory Save Error: {e}")
 
 # ==========================================
 # 4. DEADLINES & STEALTH ASSIGNMENTS 
@@ -135,9 +123,9 @@ async def scan_deadlines(memory, notifications, session):
     current_time = int(time.time())
 
     try:
-        # is_moodle implies verify_ssl=False in our updated fetch_data
-        assign_data = await fetch_data(session, MOODLE_URL, is_moodle=True, verify_ssl=False, post_data={
-            "wstoken": API_TOKEN, "wsfunction": "mod_assign_get_assignments", "moodlewsrestformat": "json"
+        assign_data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
+            "wstoken": API_TOKEN, "wsfunction": "mod_assign_get_assignments", 
+            "moodlewsrestformat": "json"
         }, return_json=True)
 
         if isinstance(assign_data, dict) and "courses" in assign_data:
@@ -193,7 +181,8 @@ async def scan_deadlines(memory, notifications, session):
                         updates_found = True
                         memory["deadlines"][assign_id] = {"timestamp": timestamp, "name": event_name, "course": course_name}
 
-        cal_data = await fetch_data(session, MOODLE_URL, is_moodle=True, verify_ssl=False, post_data={
+        # Scan Calendar for non-assignment events
+        cal_data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
             "wstoken": API_TOKEN, "wsfunction": "core_calendar_get_action_events_by_timesort", 
             "moodlewsrestformat": "json", "timesortfrom": current_time
         }, return_json=True)
@@ -236,11 +225,13 @@ async def scan_deadlines(memory, notifications, session):
                 name = event_data.get("name", "Unknown Task") if isinstance(event_data, dict) else "Unknown Task"
                 course = event_data.get("course", "Unknown Course") if isinstance(event_data, dict) else "Unknown Course"
                 
+                # Rule 3: Deleted BEFORE the deadline was over
                 if ts > current_time or ts == 0:
                     notifications.append(f"🗑️ <b>TASK DELETED</b>\n📚 {course}\n📝 {name}\n🚨 The professor has removed it before the deadline!")
                     keys_to_delete.append(event_id)
                     updates_found = True
                 
+                # Rule 4: The deadline is over (Stay silent). Delete only after 7 days to save space.
                 elif ts < (current_time - 604800):
                     keys_to_delete.append(event_id)
                     updates_found = True
@@ -288,8 +279,7 @@ def parse_timetable(html):
 async def scan_timetable(memory, notifications, session):
     print("📅 Scanning Timetable...")
     try:
-        # Cihan domains occasionally drop SSL, so we set verify_ssl=False for reliability
-        html = await fetch_data(session, TIMETABLE_URL, return_json=False, verify_ssl=False)
+        html = await fetch_data(session, TIMETABLE_URL, return_json=False)
         new_timetable = parse_timetable(html)
         old_timetable = memory["timetable"]
         updates_found = False
@@ -347,7 +337,7 @@ async def scan_moodle(memory, notifications, session):
     updates_found = False
 
     try:
-        user_data = await fetch_data(session, MOODLE_URL, is_moodle=True, verify_ssl=False, post_data={
+        user_data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
             "wstoken": API_TOKEN, "wsfunction": "core_webservice_get_site_info", "moodlewsrestformat": "json"
         }, return_json=True)
         
@@ -358,7 +348,7 @@ async def scan_moodle(memory, notifications, session):
         user_id = user_data.get("userid")
         if not user_id: return False, False
 
-        courses = await fetch_data(session, MOODLE_URL, is_moodle=True, verify_ssl=False, post_data={
+        courses = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
             "wstoken": API_TOKEN, "wsfunction": "core_enrol_get_users_courses", 
             "moodlewsrestformat": "json", "userid": user_id
         }, return_json=True)
@@ -374,7 +364,7 @@ async def scan_moodle(memory, notifications, session):
                 memory["files"][course_id] = {str(mid): 0 for mid in memory["files"][course_id]}
 
             try:
-                content_data = await fetch_data(session, MOODLE_URL, is_moodle=True, verify_ssl=False, post_data={
+                content_data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
                     "wstoken": API_TOKEN, "wsfunction": "core_course_get_contents",
                     "moodlewsrestformat": "json", "courseid": course_id
                 }, return_json=True)
@@ -460,7 +450,7 @@ async def scan_private_grades(memory, session, users_list):
         if u_name not in memory["private_grades"]: memory["private_grades"][u_name] = {}
 
         try:
-            user_data = await fetch_data(session, MOODLE_URL, is_moodle=True, verify_ssl=False, post_data={
+            user_data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
                 "wstoken": u_token, "wsfunction": "core_webservice_get_site_info", "moodlewsrestformat": "json"
             }, return_json=True)
             
@@ -472,7 +462,7 @@ async def scan_private_grades(memory, session, users_list):
             user_id = user_data.get("userid")
             if not user_id: continue
 
-            courses = await fetch_data(session, MOODLE_URL, is_moodle=True, verify_ssl=False, post_data={
+            courses = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
                 "wstoken": u_token, "wsfunction": "core_enrol_get_users_courses", 
                 "moodlewsrestformat": "json", "userid": user_id
             }, return_json=True)
@@ -489,7 +479,7 @@ async def scan_private_grades(memory, session, users_list):
                 if course_id not in memory["private_grades"][u_name]: 
                     memory["private_grades"][u_name][course_id] = {}
 
-                grade_data = await fetch_data(session, MOODLE_URL, is_moodle=True, verify_ssl=False, post_data={
+                grade_data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
                     "wstoken": u_token, "wsfunction": "gradereport_user_get_grade_items",
                     "moodlewsrestformat": "json", "courseid": course_id, "userid": user_id
                 }, return_json=True)
@@ -546,12 +536,11 @@ async def scan_private_grades(memory, session, users_list):
 async def main():
     print(f"🚀 Booting Cloud Monitor v{__version__}...")
     
-    # Claude Fix 8: Removed the global ssl=False security hole here!
-    connector = aiohttp.TCPConnector(family=socket.AF_INET)
-    
+    connector = aiohttp.TCPConnector(ssl=False, family=socket.AF_INET)
     async with aiohttp.ClientSession(connector=connector) as session:
         memory = await load_memory(session)
         
+        # 🛑 THE DATABASE LOCK 🛑
         if memory is None:
             print("❌ CRITICAL: Could not read cloud memory. Aborting run to protect database from being wiped.")
             return 
@@ -559,6 +548,7 @@ async def main():
         notifications = [] 
         memory_changed = False
         
+        # ⚓ STRICT ROUTING ⚓
         old_chat_ids = memory.get("chat_ids", [])
         new_chat_ids = list(set([str(cid).strip() for cid in HARDCODED_CHAT_IDS if str(cid).strip() not in ["0", "", "None"]]))
         
@@ -579,7 +569,6 @@ async def main():
             except Exception as e:
                 print(f"⚠️ JSON Format Error in USERS_CONFIG. Check your GitHub Secret syntax: {e}")
 
-        # Already using gather just like Claude suggested!
         results = await asyncio.gather(
             scan_moodle(memory, notifications, session),
             scan_timetable(memory, notifications, session),
