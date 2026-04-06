@@ -8,7 +8,7 @@ import json
 import html
 from bs4 import BeautifulSoup
 
-__version__ = "2.2.9" # The Strict Routing Patch
+__version__ = "2.3.0" # The Smart Deadlines Patch
 
 # ==========================================
 # 1. SETUP & CONFIGURATION
@@ -95,14 +95,7 @@ async def load_memory(session):
                 for key in default_memory:
                     if key not in memory: memory[key] = default_memory[key]
                 
-                current_time = int(time.time())
-                active_deadlines = {}
-                for eid, event_data in memory["deadlines"].items():
-                    ts = event_data.get("timestamp", 0) if isinstance(event_data, dict) else event_data
-                    if ts > current_time or ts == 0:
-                        active_deadlines[eid] = event_data
-                
-                memory["deadlines"] = active_deadlines
+                # Removed the aggressive memory wipe here so Rule 4 functions properly
                 return memory
             else:
                 print(f"⚠️ JSONBin Error {resp.status}: Refusing to load blank memory.")
@@ -152,21 +145,43 @@ async def scan_deadlines(memory, notifications, session):
                     old_data = memory["deadlines"].get(assign_id)
                     old_timestamp = old_data.get("timestamp") if isinstance(old_data, dict) else old_data
                     
-                    if old_timestamp != timestamp:
+                    # RULE 1: Brand New Assignment
+                    if old_timestamp is None:
                         updates_found = True
-                        if timestamp > 0:
-                            dt = datetime.datetime.utcfromtimestamp(timestamp) + datetime.timedelta(hours=3)
-                            date_str = dt.strftime("%A, %b %d at %I:%M %p")
-                        else:
-                            date_str = "Open-Ended (No Due Date)"
-                            
-                        if old_timestamp is None:
-                            notifications.append(f"📥 <b>NEW ASSIGNMENT</b>\n📚 {course_name}\n📝 {event_name}\n⏰ Due: {date_str}")
-                        else:
-                            notifications.append(f"⚠️ <b>DEADLINE CHANGED</b>\n📚 {course_name}\n📝 {event_name}\n⏰ New Date: {date_str}")
+                        if timestamp > current_time or timestamp == 0:
+                            if timestamp > 0:
+                                dt = datetime.datetime.utcfromtimestamp(timestamp) + datetime.timedelta(hours=3)
+                                date_str = dt.strftime("%A, %b %d at %I:%M %p")
+                            else:
+                                date_str = "Open-Ended (No Due Date)"
+                            notifications.append(f"🚨 <b>NEW ASSIGNMENT ADDED</b>\n📚 {course_name}\n📝 {event_name}\n⏰ Due: {date_str}")
                         
                         memory["deadlines"][assign_id] = {"timestamp": timestamp, "name": event_name, "course": course_name}
+                    
+                    # RULE 2: Deadline is extended
+                    elif timestamp > old_timestamp:
+                        updates_found = True
+                        extended_by_seconds = timestamp - old_timestamp
+                        
+                        days = extended_by_seconds // 86400
+                        hours = (extended_by_seconds % 86400) // 3600
+                        if days > 0 and hours > 0: time_added = f"{days} day(s) and {hours} hour(s)"
+                        elif days > 0: time_added = f"{days} day(s)"
+                        elif hours > 0: time_added = f"{hours} hour(s)"
+                        else: time_added = "less than an hour"
+                        
+                        dt = datetime.datetime.utcfromtimestamp(timestamp) + datetime.timedelta(hours=3)
+                        date_str = dt.strftime("%A, %b %d at %I:%M %p")
+                        
+                        notifications.append(f"⏰ <b>DEADLINE EXTENDED</b>\n📚 {course_name}\n📝 {event_name}\n⏳ Extended by: {time_added}\n📅 Current Deadline: {date_str}")
+                        memory["deadlines"][assign_id] = {"timestamp": timestamp, "name": event_name, "course": course_name}
+                        
+                    # Silently update memory if shortened
+                    elif timestamp != old_timestamp and timestamp < old_timestamp:
+                        updates_found = True
+                        memory["deadlines"][assign_id] = {"timestamp": timestamp, "name": event_name, "course": course_name}
 
+        # Scan Calendar for non-assignment events
         cal_data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
             "wstoken": API_TOKEN, "wsfunction": "core_calendar_get_action_events_by_timesort", 
             "moodlewsrestformat": "json", "timesortfrom": current_time
@@ -198,25 +213,31 @@ async def scan_deadlines(memory, notifications, session):
                     
                     memory["deadlines"][event_id] = {"timestamp": timestamp, "name": event_name, "course": course_name}
 
-        missing_events = []
+        # RULE 3 & RULE 4: DELETIONS & SILENCE
+        keys_to_delete = []
         for event_id, event_data in list(memory["deadlines"].items()):
             if event_id not in fetched_event_ids:
                 if not str(event_id).startswith("assign_") and not str(event_id).startswith("cal_"):
-                    del memory["deadlines"][event_id]
-                    updates_found = True
+                    keys_to_delete.append(event_id)
                     continue
 
                 ts = event_data.get("timestamp", 0) if isinstance(event_data, dict) else event_data
                 name = event_data.get("name", "Unknown Task") if isinstance(event_data, dict) else "Unknown Task"
                 course = event_data.get("course", "Unknown Course") if isinstance(event_data, dict) else "Unknown Course"
                 
+                # Rule 3: Deleted BEFORE the deadline was over
                 if ts > current_time or ts == 0:
-                    missing_events.append((event_id, course, name))
-                    
-        for event_id, course, name in missing_events:
-            notifications.append(f"🗑️ <b>TASK CANCELED</b>\n📚 {course}\n📝 {name}\n✅ The professor has removed this requirement.")
-            del memory["deadlines"][event_id]
-            updates_found = True
+                    notifications.append(f"🗑️ <b>TASK DELETED</b>\n📚 {course}\n📝 {name}\n🚨 The professor has removed it before the deadline!")
+                    keys_to_delete.append(event_id)
+                    updates_found = True
+                
+                # Rule 4: The deadline is over (Stay silent). Delete only after 7 days to save space.
+                elif ts < (current_time - 604800):
+                    keys_to_delete.append(event_id)
+                    updates_found = True
+
+        for key in keys_to_delete:
+            del memory["deadlines"][key]
 
         return updates_found, True
     except Exception as e: 
@@ -527,8 +548,7 @@ async def main():
         notifications = [] 
         memory_changed = False
         
-        # ⚓ STRICT ROUTING (v2.2.9) ⚓
-        # Completely bypass Telegram API. Force the JSON memory to strictly match GitHub Secrets.
+        # ⚓ STRICT ROUTING ⚓
         old_chat_ids = memory.get("chat_ids", [])
         new_chat_ids = list(set([str(cid).strip() for cid in HARDCODED_CHAT_IDS if str(cid).strip() not in ["0", "", "None"]]))
         
