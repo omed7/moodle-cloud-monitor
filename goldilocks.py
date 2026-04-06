@@ -94,15 +94,22 @@ async def load_memory(session):
     headers = {"X-Master-Key": JSONBIN_KEY}
     
     try:
-        # JSONBin has valid SSL
-        data = await fetch_data(session, url, return_json=True)
-        memory = data.get("record", {})
-        for key in default_memory:
-            if key not in memory: memory[key] = default_memory[key]
-        return memory
+        # We bypass fetch_data and use session.get directly so the headers stay intact!
+        req_timeout = aiohttp.ClientTimeout(total=20)
+        async with session.get(url, headers=headers, timeout=req_timeout) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                memory = data.get("record", {})
+                for key in default_memory:
+                    if key not in memory: memory[key] = default_memory[key]
+                return memory
+            else:
+                print(f"⚠️ JSONBin Error {resp.status}: Refusing to load blank memory.")
+                return None 
     except Exception as e:
         print(f"⚠️ Cloud Memory Load Crash: {e}")
         return None 
+
 
 async def save_memory(session, memory):
     if not JSONBIN_ID or not JSONBIN_KEY: return
