@@ -450,27 +450,34 @@ async def scan_private_grades(memory, session, users_list):
         if u_name not in memory["private_grades"]: memory["private_grades"][u_name] = {}
 
         try:
-            # Notice: verify_ssl=False is removed to perfectly match v2.3.0!
+            # 1. Check if the token is valid
             user_data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
                 "wstoken": u_token, "wsfunction": "core_webservice_get_site_info", "moodlewsrestformat": "json"
             }, return_json=True)
             
             if not user_data or "exception" in user_data: 
                 print(f"🛑 Grades Token Rejected for {u_name}: {user_data}")
-                
-                # THE FIX: Check if it's just a dead token vs a real server crash
+                # The Anti-Hostage Patch
                 if isinstance(user_data, dict) and user_data.get("errorcode") == "invalidtoken":
                     print(f"⚠️ {u_name}'s token is dead! Skipping them so the bot doesn't crash.")
-                    # We DO NOT set servers_ok = False here. We just skip them!
                 else:
-                    servers_ok = False # Real server crash
-                    
+                    servers_ok = False 
                 continue
                 
             user_id = user_data.get("userid")
             if not user_id: continue
 
+            # 2. Fetch the user's courses (This is the line that got accidentally deleted!)
+            courses = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
+                "wstoken": u_token, "wsfunction": "core_enrol_get_users_courses", 
+                "moodlewsrestformat": "json", "userid": user_id
+            }, return_json=True)
+            
+            if not isinstance(courses, list): 
+                servers_ok = False
+                continue
 
+            # 3. Scan grades for each course
             for course in courses:
                 course_id = str(course['id'])
                 course_name = safe_html(course['fullname'])
@@ -529,6 +536,7 @@ async def scan_private_grades(memory, session, users_list):
             servers_ok = False
 
     return updates_found, servers_ok
+
 
 # ==========================================
 # 8. THE CLOUD BATCH TRIGGER
