@@ -450,7 +450,8 @@ async def scan_private_grades(memory, session, users_list):
         if u_name not in memory["private_grades"]: memory["private_grades"][u_name] = {}
 
         try:
-            user_data = await fetch_data(session, MOODLE_URL, is_moodle=True, verify_ssl=False, post_data={
+            # Notice: verify_ssl=False is removed to perfectly match v2.3.0!
+            user_data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
                 "wstoken": u_token, "wsfunction": "core_webservice_get_site_info", "moodlewsrestformat": "json"
             }, return_json=True)
             
