@@ -449,27 +449,26 @@ async def scan_private_grades(memory, session, users_list):
         if not u_token or not u_chat: continue
         if u_name not in memory["private_grades"]: memory["private_grades"][u_name] = {}
 
-        try:
-            user_data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
+                try:
+            user_data = await fetch_data(session, MOODLE_URL, is_moodle=True, verify_ssl=False, post_data={
                 "wstoken": u_token, "wsfunction": "core_webservice_get_site_info", "moodlewsrestformat": "json"
             }, return_json=True)
             
             if not user_data or "exception" in user_data: 
                 print(f"🛑 Grades Token Rejected for {u_name}: {user_data}")
-                servers_ok = False
+                
+                # THE FIX: Check if it's just a dead token vs a real server crash
+                if isinstance(user_data, dict) and user_data.get("errorcode") == "invalidtoken":
+                    print(f"⚠️ {u_name}'s token is dead! Skipping them so the bot doesn't crash.")
+                    # We DO NOT set servers_ok = False here. We just skip them!
+                else:
+                    servers_ok = False # Real server crash
+                    
                 continue
                 
             user_id = user_data.get("userid")
             if not user_id: continue
 
-            courses = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
-                "wstoken": u_token, "wsfunction": "core_enrol_get_users_courses", 
-                "moodlewsrestformat": "json", "userid": user_id
-            }, return_json=True)
-            
-            if not isinstance(courses, list): 
-                servers_ok = False
-                continue
 
             for course in courses:
                 course_id = str(course['id'])
