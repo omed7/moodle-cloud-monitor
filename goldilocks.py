@@ -449,7 +449,7 @@ async def scan_private_grades(memory, session, users_list):
         if not u_token or not u_chat: continue
         if u_name not in memory["private_grades"]: memory["private_grades"][u_name] = {}
 
-            try:
+        try:
             user_data = await fetch_data(session, MOODLE_URL, is_moodle=True, verify_ssl=False, post_data={
                 "wstoken": u_token, "wsfunction": "core_webservice_get_site_info", "moodlewsrestformat": "json"
             }, return_json=True)
