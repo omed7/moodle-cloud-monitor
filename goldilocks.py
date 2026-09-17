@@ -208,8 +208,8 @@ async def scan_deadlines(memory, notifications, session):
             "moodlewsrestformat": "json"
         })
         if isinstance(assign_data, dict) and "exception" in assign_data:
-            SERVER_NOTES.append("deadlines: token rejected")
-            print(f"🛑 Deadlines: token rejected: {assign_data.get('message')}")
+            SERVER_NOTES.append("deadlines call failed: " + str(assign_data.get("message", "unknown error")))
+            print(f"🛑 Deadlines call failed: {assign_data.get('message')}")
             return False, False
 
         if isinstance(assign_data, dict) and "courses" in assign_data:
@@ -262,11 +262,11 @@ async def scan_deadlines(memory, notifications, session):
         # Scan Calendar for non-assignment events (limitnum raised so busy weeks aren't cut off)
         cal_data = await fetch_data(session, MOODLE_URL, post_data={
             "wstoken": API_TOKEN, "wsfunction": "core_calendar_get_action_events_by_timesort",
-            "moodlewsrestformat": "json", "timesortfrom": current_time, "limitnum": 100
+            "moodlewsrestformat": "json", "timesortfrom": current_time, "limitnum": 50
         })
         if isinstance(cal_data, dict) and "exception" in cal_data:
-            SERVER_NOTES.append("calendar: token rejected")
-            print(f"🛑 Calendar: token rejected: {cal_data.get('message')}")
+            SERVER_NOTES.append("calendar call failed: " + str(cal_data.get("message", "unknown error")))
+            print(f"🛑 Calendar call failed: {cal_data.get('message')}")
             return False, False
 
         if isinstance(cal_data, dict) and "events" in cal_data:

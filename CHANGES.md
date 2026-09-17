@@ -30,8 +30,8 @@
   Moodle token inside the link — your explicit choice.
   (Trade-off, stated once: anyone with that link can act as you on Moodle.)
 - **One trigger only:** cron-job.org. No GitHub backup schedule.
-- **Calendar `limitnum=100`:** the "upcoming events" feed defaults to a cap of 20 items;
-  raised to 100 so a busy week can't hide events past the 20th.
+- **Calendar cap:** the "upcoming events" feed defaulted to 20 items; set to **50** —
+  the maximum this Moodle build accepts (learned from the first live run: 100 is rejected).
 - Timezone-aware timestamps (Iraq time) · TLS verification ON · explicit User-Agent
   (Cloudflare) · version bumps: Python 3.12, checkout@v5, setup-python@v6,
   aiohttp 3.14.3, bs4 4.15.0.
