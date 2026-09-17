@@ -2,37 +2,49 @@ name: Moodle Cloud Monitor
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Run mode'
+        type: choice
+        options: [scan, list-courses]
+        default: scan
 
-# This single block fixes the Node.js warning
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: moodle-monitor
+  cancel-in-progress: true
 
 jobs:
   scan-moodle:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
-          python-version: '3.10'
+          python-version: '3.12'
 
       - name: Install Dependencies
-        run: pip install aiohttp==3.9.3 beautifulsoup4==4.12.3
+        run: pip install aiohttp==3.14.3 beautifulsoup4==4.15.0
 
-      - name: Run Goldilocks Scanner
+      - name: Run Monitor
         env:
           MOODLE_API_TOKEN: ${{ secrets.MOODLE_API_TOKEN }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
-          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
           MOODLE_API_URL: ${{ secrets.MOODLE_API_URL }}
-          JSONBIN_ID: ${{ secrets.JSONBIN_ID }}
-          JSONBIN_KEY: ${{ secrets.JSONBIN_KEY }}
-          USERS_CONFIG: ${{ secrets.USERS_CONFIG }}
-          IGNORE_COURSES: ${{ secrets.IGNORE_COURSES }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ vars.CHAT_ID }}
+          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
           TIMETABLE_URL: ${{ secrets.TIMETABLE_URL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          IGNORE_COURSES: ${{ vars.IGNORE_COURSES }}
+          QUIET_RUN: ${{ vars.QUIET_RUN }}
+          HEALTHCHECK_URL: ${{ vars.HEALTHCHECK_URL }}
+          RUN_MODE: ${{ github.event.inputs.mode }}
+          GH_TOKEN: ${{ github.token }}
         run: python goldilocks.py

@@ -1,3 +1,24 @@
+#!/usr/bin/env python3
+# ==============================================================
+# goldilocks.py — Moodle Cloud Monitor v2.5.0
+# Single-owner edition: watches YOUR courses, deadlines and
+# timetable, plus (privately) YOUR grades — and reports to
+# Telegram. State lives in Supabase. Loud when broken.
+#
+# Major changes vs v2.3.0:
+#   - State store: JSONBin -> Supabase (single monitor_state row)
+#   - Host fixed: moodle.uod.ac -> moodle.duhokcihan.edu.krd
+#   - Multi-user removed (no USERS_CONFIG); grades are admin-only
+#   - CHAT_ID + IGNORE_COURSES come from repo Variables
+#   - QUIET_RUN=1: preview mode — alerts go to admin only (group skipped)
+#   - Loud death: aborts alert the admin and exit non-zero
+#   - Per-scanner rollback: one broken scanner no longer eats
+#     the others' alerts (state is restored, not silently saved)
+#   - No silent fallbacks for missing config, ever
+#   - Download links keep the Moodle token (owner's call; group is trusted)
+#   - Explicit User-Agent on all requests (Cloudflare-friendly)
+# ==============================================================
+
 import asyncio
 import aiohttp
 import os
@@ -6,115 +27,174 @@ import time
 import datetime
 import json
 import html
+import sys
 from bs4 import BeautifulSoup
+from zoneinfo import ZoneInfo
 
-__version__ = "2.3.0" # The Smart Deadlines Patch
+__version__ = "2.5.0"
 
 # ==========================================
-# 1. SETUP & CONFIGURATION
+# 1. SETUP & CONFIGURATION (no silent fallbacks)
 # ==========================================
-ignore_courses_env = os.environ.get("IGNORE_COURSES", "195,196,197,198,199,200,201")
-IGNORE_COURSES = [c.strip() for c in ignore_courses_env.split(",") if c.strip()]
+MOODLE_RAW    = os.environ.get("MOODLE_API_URL", "").strip()
+API_TOKEN     = os.environ.get("MOODLE_API_TOKEN", "").strip()
+BOT_TOKEN     = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "").strip()
+TIMETABLE_URL = os.environ.get("TIMETABLE_URL", "").strip()
+SUPABASE_URL  = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_KEY  = os.environ.get("SUPABASE_KEY", "").strip()
+HEALTHCHECK_URL = os.environ.get("HEALTHCHECK_URL", "").strip()
+GH_TOKEN      = os.environ.get("GH_TOKEN", "").strip()
+REPO_SLUG     = os.environ.get("GITHUB_REPOSITORY", "").strip()
+RUN_MODE      = os.environ.get("RUN_MODE", "").strip() or "scan"
+QUIET_RUN     = os.environ.get("QUIET_RUN", "").strip().lower() in ("1", "true", "yes", "on")
 
-TIMETABLE_URL = os.environ.get("TIMETABLE_URL", "https://tb.duhokcihan.edu.krd/departtimtable.php?departmentNo=11&ClassNo1=1&GroupNo1=1")
+SITE_URL   = MOODLE_RAW.rstrip("/")
+MOODLE_URL = f"{SITE_URL}/webservice/rest/server.php" if SITE_URL else ""
 
-API_TOKEN = os.environ.get("MOODLE_API_TOKEN")
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+# Recipients: exactly the IDs listed in the repo Variable. Nobody else, ever.
+CHAT_IDS = [c.strip() for c in os.environ.get("CHAT_ID", "").split(",") if c.strip()]
 
-# The Comma-Separated ID Parser
-chat_id_env = os.environ.get("CHAT_ID", "")
-HARDCODED_CHAT_IDS = [cid.strip() for cid in chat_id_env.split(",") if cid.strip()]
-
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID") 
-RAW_URL = os.environ.get("MOODLE_API_URL", "https://moodle.uod.ac")
-
-JSONBIN_ID = os.environ.get("JSONBIN_ID")
-JSONBIN_KEY = os.environ.get("JSONBIN_KEY")
-
-if RAW_URL and not RAW_URL.endswith('/webservice/rest/server.php'):
-    MOODLE_URL = RAW_URL.rstrip('/') + '/webservice/rest/server.php'
-else:
-    MOODLE_URL = RAW_URL
+# IGNORE_COURSES: course IDs to skip. Non-numeric junk and the "0" placeholder are dropped.
+IGNORE_COURSES = [c.strip() for c in os.environ.get("IGNORE_COURSES", "").split(",")
+                  if c.strip().isdigit() and c.strip() != "0"]
 
 TELEGRAM_URL = f"https://moodle-tele-proxy.fy20155.workers.dev/bot{BOT_TOKEN}/sendMessage"
 
+UA = "MoodleMonitor/2.5"
+IRAQ_TZ = ZoneInfo("Asia/Baghdad")
+
+# Per-run reasons for strike alerts ("token rejected" vs "site down")
+SERVER_NOTES = []
+
+def config_problems():
+    required = {
+        "MOODLE_API_URL": MOODLE_RAW,
+        "MOODLE_API_TOKEN": API_TOKEN,
+        "TELEGRAM_BOT_TOKEN": BOT_TOKEN,
+        "ADMIN_CHAT_ID": ADMIN_CHAT_ID,
+        "TIMETABLE_URL": TIMETABLE_URL,
+        "SUPABASE_URL": SUPABASE_URL,
+        "SUPABASE_KEY": SUPABASE_KEY,
+    }
+    return [k for k, v in required.items() if not v]
+
+# ==========================================
+# 2. NETWORK HELPERS
+# ==========================================
 def safe_html(text):
     if not text: return ""
     clean_text = html.unescape(str(text))
     return clean_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-# ==========================================
-# 2. NETWORK HELPER
-# ==========================================
-async def fetch_data(session, url, is_moodle=False, post_data=None, return_json=True):
-    headers = {}
-    if return_json: headers["Accept"] = "application/json"
-    if is_moodle: headers["User-Agent"] = "MoodleMobile"
-        
-    if post_data:
-        async with session.post(url, data=post_data, headers=headers, timeout=15) as resp:
-            resp.raise_for_status() 
-            return await resp.json() if return_json else await resp.text()
-    else:
-        async with session.get(url, headers=headers, timeout=15) as resp:
+async def fetch_data(session, url, post_data=None, json_body=None, return_json=True, headers=None):
+    h = {"User-Agent": UA}
+    if headers: h.update(headers)
+    if return_json: h["Accept"] = "application/json"
+    if json_body is not None:
+        async with session.post(url, json=json_body, headers=h, timeout=20) as resp:
             resp.raise_for_status()
             return await resp.json() if return_json else await resp.text()
+    if post_data:
+        async with session.post(url, data=post_data, headers=h, timeout=20) as resp:
+            resp.raise_for_status()
+            return await resp.json() if return_json else await resp.text()
+    async with session.get(url, headers=h, timeout=20) as resp:
+        resp.raise_for_status()
+        return await resp.json() if return_json else await resp.text()
 
 async def send_telegram(session, message, target_chat):
-    payload = {
-        "chat_id": target_chat, 
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
+    """Send one message. Failures are logged — never silent."""
+    payload = {"chat_id": target_chat, "text": message, "parse_mode": "HTML",
+               "disable_web_page_preview": True}
     try:
-        await fetch_data(session, TELEGRAM_URL, post_data=payload, return_json=True)
-        await asyncio.sleep(1) 
-    except Exception:
-        pass 
+        await fetch_data(session, TELEGRAM_URL, post_data=payload)
+        await asyncio.sleep(1)
+        return True
+    except Exception as e:
+        print(f"⚠️ Telegram send failed (chat {target_chat}): {type(e).__name__}: {e}")
+        return False
+
+async def send_alert_dedup(session, text):
+    """Admin alert with de-dupe: if the previous run also failed, stay quiet (no spam)."""
+    suppress = False
+    if GH_TOKEN and REPO_SLUG:
+        try:
+            url = f"https://api.github.com/repos/{REPO_SLUG}/actions/runs?per_page=5"
+            runs = await fetch_data(session, url, headers={"Authorization": f"token {GH_TOKEN}"})
+            cur = os.environ.get("GITHUB_RUN_ID", "")
+            prev = [r for r in runs.get("workflow_runs", []) if str(r.get("id")) != cur]
+            if prev and prev[0].get("conclusion") == "failure":
+                suppress = True
+        except Exception as e:
+            print(f"⚠️ Alert de-dupe check failed: {e}")
+    if suppress:
+        print("🔇 Duplicate alert suppressed (previous run already failed).")
+        return
+    if BOT_TOKEN and ADMIN_CHAT_ID:
+        await send_telegram(session, text, ADMIN_CHAT_ID)
+    else:
+        print("⚠️ Telegram not configured — alert not sent to admin.")
+
+async def abort_run(session, reason):
+    """Loud death: alert the admin, then exit non-zero."""
+    print(f"🛑 ABORT: {reason}")
+    await send_alert_dedup(session, f"🚨 <b>MONITOR ABORTED</b>\n{reason}\n\nNothing was scanned; state is untouched.")
+    raise SystemExit(1)
 
 # ==========================================
-# 3. CLOUD MEMORY MANAGEMENT
+# 3. CLOUD MEMORY (SUPABASE)
 # ==========================================
+DEFAULT_MEMORY_KEYS = {"grades": {}, "files": {}, "timetable": {}, "deadlines": {},
+                       "server_status": "ok"}
+
 async def load_memory(session):
-    print("☁️ Fetching memory from Cloud Database...")
-    default_memory = {
-        "grades": {}, "private_grades": {}, "files": {}, "timetable": {}, 
-        "deadlines": {}, "server_status": "ok", "chat_ids": [], "last_update_id": 0
-    }
-    if not JSONBIN_ID or not JSONBIN_KEY: return default_memory
-        
-    url = f"https://api.jsonbin.io/v3/b/{JSONBIN_ID}"
-    headers = {"X-Master-Key": JSONBIN_KEY}
-    
-    try:
-        async with session.get(url, headers=headers, timeout=20) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                memory = data.get("record", {})
-                for key in default_memory:
-                    if key not in memory: memory[key] = default_memory[key]
-                
-                # Removed the aggressive memory wipe here so Rule 4 functions properly
-                return memory
-            else:
-                print(f"⚠️ JSONBin Error {resp.status}: Refusing to load blank memory.")
-                return None 
-    except Exception as e:
-        print(f"⚠️ Cloud Memory Load Crash: {e}")
-        return None 
+    """Returns (memory, error). memory=None means: do not run (protect the state)."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return None, "Supabase config missing (SUPABASE_URL / SUPABASE_KEY)"
+    url = f"{SUPABASE_URL}/rest/v1/monitor_state?id=eq.1&select=data"
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    err = "unknown error"
+    for attempt in (1, 2):
+        try:
+            rows = await fetch_data(session, url, headers=headers)
+            if isinstance(rows, list) and rows:
+                data = rows[0].get("data") or {}
+                if not isinstance(data, dict): data = {}
+                for k, v in DEFAULT_MEMORY_KEYS.items():
+                    data.setdefault(k, v)
+                return data, None
+            print("🆕 Store reachable but row empty — starting fresh memory.")
+            return json.loads(json.dumps(DEFAULT_MEMORY_KEYS)), None
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            print(f"⚠️ Store load failed (attempt {attempt}/2): {err}")
+            await asyncio.sleep(3)
+    return None, err
 
 async def save_memory(session, memory):
-    if not JSONBIN_ID or not JSONBIN_KEY: return
-    url = f"https://api.jsonbin.io/v3/b/{JSONBIN_ID}"
-    headers = {"X-Master-Key": JSONBIN_KEY, "Content-Type": "application/json"}
-    try:
-        await session.put(url, json=memory, headers=headers, timeout=10)
-    except Exception as e: 
-        print(f"⚠️ Cloud Memory Save Error: {e}")
+    """Upsert the single state row. Returns True/False."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        print("⚠️ save_memory: Supabase not configured.")
+        return False
+    url = f"{SUPABASE_URL}/rest/v1/monitor_state"
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+               "Content-Type": "application/json",
+               "Prefer": "resolution=merge-duplicates,return=minimal"}
+    payload = [{"id": 1, "data": memory,
+                "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}]
+    for attempt in (1, 2):
+        try:
+            await fetch_data(session, url, json_body=payload, return_json=False, headers=headers)
+            return True
+        except Exception as e:
+            print(f"⚠️ Store save failed (attempt {attempt}/2): {type(e).__name__}: {e}")
+            await asyncio.sleep(3)
+    print("❌ STORE SAVE FAILED — this run's state was not persisted.")
+    return False
 
 # ==========================================
-# 4. DEADLINES & STEALTH ASSIGNMENTS 
+# 4. DEADLINES & CALENDAR SCANNER
 # ==========================================
 async def scan_deadlines(memory, notifications, session):
     print("⏳ Scanning Assignments & Deadlines...")
@@ -123,94 +203,92 @@ async def scan_deadlines(memory, notifications, session):
     current_time = int(time.time())
 
     try:
-        assign_data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
-            "wstoken": API_TOKEN, "wsfunction": "mod_assign_get_assignments", 
+        assign_data = await fetch_data(session, MOODLE_URL, post_data={
+            "wstoken": API_TOKEN, "wsfunction": "mod_assign_get_assignments",
             "moodlewsrestformat": "json"
-        }, return_json=True)
+        })
+        if isinstance(assign_data, dict) and "exception" in assign_data:
+            SERVER_NOTES.append("deadlines: token rejected")
+            print(f"🛑 Deadlines: token rejected: {assign_data.get('message')}")
+            return False, False
 
         if isinstance(assign_data, dict) and "courses" in assign_data:
             for course_obj in assign_data["courses"]:
                 course_id = str(course_obj.get("id"))
                 if course_id in IGNORE_COURSES: continue
-                
                 course_name = safe_html(course_obj.get("fullname", "Unknown Course"))
-                
+
                 for assign in course_obj.get("assignments", []):
                     assign_id = "assign_" + str(assign.get("id"))
                     fetched_event_ids.add(assign_id)
-                    
                     event_name = safe_html(assign.get("name", "Unknown Assignment"))
                     timestamp = assign.get("duedate", 0)
-                    
+
                     old_data = memory["deadlines"].get(assign_id)
                     old_timestamp = old_data.get("timestamp") if isinstance(old_data, dict) else old_data
-                    
-                    # RULE 1: Brand New Assignment
+
+                    # RULE 1: Brand new assignment
                     if old_timestamp is None:
                         updates_found = True
                         if timestamp > current_time or timestamp == 0:
                             if timestamp > 0:
-                                dt = datetime.datetime.utcfromtimestamp(timestamp) + datetime.timedelta(hours=3)
+                                dt = datetime.datetime.fromtimestamp(timestamp, tz=IRAQ_TZ)
                                 date_str = dt.strftime("%A, %b %d at %I:%M %p")
                             else:
                                 date_str = "Open-Ended (No Due Date)"
                             notifications.append(f"🚨 <b>NEW ASSIGNMENT ADDED</b>\n📚 {course_name}\n📝 {event_name}\n⏰ Due: {date_str}")
-                        
                         memory["deadlines"][assign_id] = {"timestamp": timestamp, "name": event_name, "course": course_name}
-                    
-                    # RULE 2: Deadline is extended
+
+                    # RULE 2: Deadline extended
                     elif timestamp > old_timestamp:
                         updates_found = True
                         extended_by_seconds = timestamp - old_timestamp
-                        
                         days = extended_by_seconds // 86400
                         hours = (extended_by_seconds % 86400) // 3600
                         if days > 0 and hours > 0: time_added = f"{days} day(s) and {hours} hour(s)"
                         elif days > 0: time_added = f"{days} day(s)"
                         elif hours > 0: time_added = f"{hours} hour(s)"
                         else: time_added = "less than an hour"
-                        
-                        dt = datetime.datetime.utcfromtimestamp(timestamp) + datetime.timedelta(hours=3)
+                        dt = datetime.datetime.fromtimestamp(timestamp, tz=IRAQ_TZ)
                         date_str = dt.strftime("%A, %b %d at %I:%M %p")
-                        
                         notifications.append(f"⏰ <b>DEADLINE EXTENDED</b>\n📚 {course_name}\n📝 {event_name}\n⏳ Extended by: {time_added}\n📅 Current Deadline: {date_str}")
                         memory["deadlines"][assign_id] = {"timestamp": timestamp, "name": event_name, "course": course_name}
-                        
+
                     # Silently update memory if shortened
                     elif timestamp != old_timestamp and timestamp < old_timestamp:
                         updates_found = True
                         memory["deadlines"][assign_id] = {"timestamp": timestamp, "name": event_name, "course": course_name}
 
-        # Scan Calendar for non-assignment events
-        cal_data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
-            "wstoken": API_TOKEN, "wsfunction": "core_calendar_get_action_events_by_timesort", 
-            "moodlewsrestformat": "json", "timesortfrom": current_time
-        }, return_json=True)
-        
+        # Scan Calendar for non-assignment events (limitnum raised so busy weeks aren't cut off)
+        cal_data = await fetch_data(session, MOODLE_URL, post_data={
+            "wstoken": API_TOKEN, "wsfunction": "core_calendar_get_action_events_by_timesort",
+            "moodlewsrestformat": "json", "timesortfrom": current_time, "limitnum": 100
+        })
+        if isinstance(cal_data, dict) and "exception" in cal_data:
+            SERVER_NOTES.append("calendar: token rejected")
+            print(f"🛑 Calendar: token rejected: {cal_data.get('message')}")
+            return False, False
+
         if isinstance(cal_data, dict) and "events" in cal_data:
             for event in cal_data["events"]:
                 if event.get("modulename") == "assign": continue
-
                 event_id = "cal_" + str(event.get("id"))
                 fetched_event_ids.add(event_id)
-                
                 event_name = safe_html(event.get("name", "Unknown Event"))
                 course_name = safe_html(event.get("course", {}).get("fullname", "Unknown Course"))
                 timestamp = event.get("timesort")
-                
+
                 old_data = memory["deadlines"].get(event_id)
                 old_timestamp = old_data.get("timestamp") if isinstance(old_data, dict) else old_data
-                
+
                 if old_timestamp != timestamp:
                     updates_found = True
-                    dt = datetime.datetime.utcfromtimestamp(timestamp) + datetime.timedelta(hours=3)
+                    dt = datetime.datetime.fromtimestamp(timestamp, tz=IRAQ_TZ)
                     date_str = dt.strftime("%A, %b %d at %I:%M %p")
-                    
                     if old_timestamp is None:
                         notifications.append(f"🚨 <b>UPCOMING EVENT</b>\n📚 {course_name}\n📝 {event_name}\n⏰ Due: {date_str}")
                     else:
                         notifications.append(f"⚠️ <b>EVENT TIME CHANGED</b>\n📚 {course_name}\n📝 {event_name}\n⏰ New Date: {date_str}")
-                    
                     memory["deadlines"][event_id] = {"timestamp": timestamp, "name": event_name, "course": course_name}
 
         # RULE 3 & RULE 4: DELETIONS & SILENCE
@@ -220,18 +298,16 @@ async def scan_deadlines(memory, notifications, session):
                 if not str(event_id).startswith("assign_") and not str(event_id).startswith("cal_"):
                     keys_to_delete.append(event_id)
                     continue
-
                 ts = event_data.get("timestamp", 0) if isinstance(event_data, dict) else event_data
                 name = event_data.get("name", "Unknown Task") if isinstance(event_data, dict) else "Unknown Task"
                 course = event_data.get("course", "Unknown Course") if isinstance(event_data, dict) else "Unknown Course"
-                
+
                 # Rule 3: Deleted BEFORE the deadline was over
                 if ts > current_time or ts == 0:
                     notifications.append(f"🗑️ <b>TASK DELETED</b>\n📚 {course}\n📝 {name}\n🚨 The professor has removed it before the deadline!")
                     keys_to_delete.append(event_id)
                     updates_found = True
-                
-                # Rule 4: The deadline is over (Stay silent). Delete only after 7 days to save space.
+                # Rule 4: Deadline over (stay silent); drop the key only after 7 days
                 elif ts < (current_time - 604800):
                     keys_to_delete.append(event_id)
                     updates_found = True
@@ -240,25 +316,26 @@ async def scan_deadlines(memory, notifications, session):
             del memory["deadlines"][key]
 
         return updates_found, True
-    except Exception as e: 
+    except Exception as e:
+        SERVER_NOTES.append("deadlines scan crashed")
         print(f"🚨 Task Scan Crash: {e}")
         return False, False
 
 # ==========================================
 # 5. TIMETABLE SCANNER
 # ==========================================
-def parse_timetable(html):
-    soup = BeautifulSoup(html, 'html.parser')
+def parse_timetable(page_html):
+    soup = BeautifulSoup(page_html, 'html.parser')
     tables = soup.find_all('table')
     if not tables: return {}
-    
-    table = tables[0] 
+
+    table = tables[0]
     rows = table.find_all('tr')
     if not rows: return {}
-    
+
     headers = [th.get_text(" ", strip=True) for th in rows[0].find_all(['th', 'td'])]
     timetable_data = {}
-    
+
     for i in range(1, len(rows)):
         r1_cells = rows[i].find_all(['td', 'th'])
         first_cell = r1_cells[0].get_text(strip=True).lower()
@@ -269,7 +346,6 @@ def parse_timetable(html):
                 time_slot = headers[j] if j < len(headers) else f"Slot_{j}"
                 subj = r1_cells[j].get_text(" ", strip=True)
                 instructor = r2_cells[j-1].get_text(" ", strip=True) if j-1 < len(r2_cells) else ""
-                
                 box_id = f"{day_name} ({time_slot})"
                 content = f"{subj} / {instructor}".strip(' /')
                 if not content: content = "Rest Hour"
@@ -279,11 +355,11 @@ def parse_timetable(html):
 async def scan_timetable(memory, notifications, session):
     print("📅 Scanning Timetable...")
     try:
-        html = await fetch_data(session, TIMETABLE_URL, return_json=False)
-        new_timetable = parse_timetable(html)
+        page_html = await fetch_data(session, TIMETABLE_URL, return_json=False)
+        new_timetable = parse_timetable(page_html)
         old_timetable = memory["timetable"]
         updates_found = False
-        
+
         for box_id, new_content in new_timetable.items():
             old_content = old_timetable.get(box_id)
             if old_content != new_content:
@@ -295,12 +371,12 @@ async def scan_timetable(memory, notifications, session):
                 except ValueError:
                     day = "Unknown Day"
                     time_str = box_id
-                
+
                 new_c = safe_html(new_content)
                 old_c = safe_html(old_content)
-                
+
                 if old_content is None:
-                    if new_content != "Rest Hour": 
+                    if new_content != "Rest Hour":
                         notifications.append(f"📅 <b>CLASS TRACKED</b>\n📆 Day: {day}\n⏰ Time: {time_str}\n✅ {new_c}")
                 else:
                     if new_content == "Rest Hour":
@@ -310,12 +386,13 @@ async def scan_timetable(memory, notifications, session):
                     else:
                         notifications.append(f"⚠️ <b>TIMETABLE CHANGED</b>\n📆 Day: {day}\n⏰ Time: {time_str}\n❌ Old: {old_c}\n✅ New: {new_c}")
         return updates_found, True
-    except Exception as e: 
+    except Exception as e:
+        SERVER_NOTES.append("timetable unreachable or layout changed")
         print(f"🚨 Timetable Scan Crash: {e}")
         return False, False
 
 # ==========================================
-# 6. GLOBAL MOODLE SCANNER 
+# 6. GLOBAL MOODLE FILES SCANNER
 # ==========================================
 def format_file_name(mod_name, mod_type):
     name_lower = mod_name.lower()
@@ -329,30 +406,34 @@ def format_file_name(mod_name, mod_type):
 
 def format_iraq_time(timestamp):
     if not timestamp or timestamp == 0: return ""
-    dt = datetime.datetime.utcfromtimestamp(timestamp) + datetime.timedelta(hours=3)
+    dt = datetime.datetime.fromtimestamp(timestamp, tz=IRAQ_TZ)
     return f"\n⏳ Modified: {dt.strftime('%A, %b %d, %Y at %I:%M %p')}"
 
 async def scan_moodle(memory, notifications, session):
-    print("🔍 Scanning Moodle for Global Files...")
+    print("🔍 Scanning Moodle for files...")
     updates_found = False
 
     try:
-        user_data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
+        user_data = await fetch_data(session, MOODLE_URL, post_data={
             "wstoken": API_TOKEN, "wsfunction": "core_webservice_get_site_info", "moodlewsrestformat": "json"
-        }, return_json=True)
-        
-        if not user_data or "exception" in user_data: 
-            print(f"🛑 Global Moodle Token Rejected: {user_data}")
+        })
+        if not user_data or "exception" in user_data:
+            SERVER_NOTES.append("Moodle token rejected")
+            print(f"🛑 Moodle Token Rejected: {user_data}")
             return False, False
-            
-        user_id = user_data.get("userid")
-        if not user_id: return False, False
 
-        courses = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
-            "wstoken": API_TOKEN, "wsfunction": "core_enrol_get_users_courses", 
+        user_id = user_data.get("userid")
+        if not user_id:
+            SERVER_NOTES.append("Moodle: no user id")
+            return False, False
+
+        courses = await fetch_data(session, MOODLE_URL, post_data={
+            "wstoken": API_TOKEN, "wsfunction": "core_enrol_get_users_courses",
             "moodlewsrestformat": "json", "userid": user_id
-        }, return_json=True)
-        if not isinstance(courses, list): return False, False
+        })
+        if not isinstance(courses, list):
+            SERVER_NOTES.append("Moodle: course list failed")
+            return False, False
 
         for course in courses:
             course_id = str(course['id'])
@@ -364,11 +445,10 @@ async def scan_moodle(memory, notifications, session):
                 memory["files"][course_id] = {str(mid): 0 for mid in memory["files"][course_id]}
 
             try:
-                content_data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
+                content_data = await fetch_data(session, MOODLE_URL, post_data={
                     "wstoken": API_TOKEN, "wsfunction": "core_course_get_contents",
                     "moodlewsrestformat": "json", "courseid": course_id
-                }, return_json=True)
-                
+                })
                 fetched_mod_ids = set()
 
                 if isinstance(content_data, list):
@@ -377,10 +457,9 @@ async def scan_moodle(memory, notifications, session):
                         for mod in section.get("modules", []):
                             mod_id = str(mod.get("id"))
                             fetched_mod_ids.add(mod_id)
-                            
                             mod_name = mod.get("name", "Unknown File")
                             mod_type = mod.get("modname", "resource")
-                            
+
                             time_modified = 0
                             fileurl = ""
                             if "contents" in mod and len(mod["contents"]) > 0:
@@ -388,7 +467,8 @@ async def scan_moodle(memory, notifications, session):
                                 fileurl = mod["contents"][0].get("fileurl", "")
                             elif "url" in mod:
                                 fileurl = mod["url"]
-                            
+
+                            # Download links keep the Moodle token — owner's informed choice.
                             html_link = ""
                             if fileurl:
                                 if "webservice/pluginfile.php" in fileurl:
@@ -400,12 +480,11 @@ async def scan_moodle(memory, notifications, session):
                             old_data = memory["files"][course_id].get(mod_id)
                             old_time = old_data.get("time", 0) if isinstance(old_data, dict) else (old_data if old_data is not None else None)
                             formatted_name = safe_html(format_file_name(mod_name, mod_type))
-                            
+
                             if old_time is None:
                                 memory["files"][course_id][mod_id] = {"time": time_modified, "name": formatted_name}
                                 updates_found = True
                                 notifications.append(f"📢 <b>NEW CONTENT:</b> {course_name}\n📂 Topic: {section_name}\n{formatted_name}{html_link}")
-                                
                             elif time_modified != old_time:
                                 memory["files"][course_id][mod_id] = {"time": time_modified, "name": formatted_name}
                                 updates_found = True
@@ -425,225 +504,247 @@ async def scan_moodle(memory, notifications, session):
 
             except Exception as e:
                 print(f"⚠️ Internal File Sync Error for course {course_id}: {e}")
-                
+
         return updates_found, True
-    except Exception as e: 
+    except Exception as e:
+        SERVER_NOTES.append("Moodle scan crashed")
         print(f"🚨 Global Moodle Scan Crash: {e}")
         return False, False
 
 # ==========================================
-# 7. MULTI-TENANT PRIVATE GRADES 
+# 7. PRIVATE GRADES SCANNER (admin only)
 # ==========================================
-async def scan_private_grades(memory, session, users_list):
-    print("🎓 Scanning Private Grades for registered users...")
+async def scan_grades(memory, notifications, session):
+    print("🎓 Scanning grades (private, admin-only)...")
     updates_found = False
-    servers_ok = True
 
-    if "private_grades" not in memory: memory["private_grades"] = {}
+    try:
+        user_data = await fetch_data(session, MOODLE_URL, post_data={
+            "wstoken": API_TOKEN, "wsfunction": "core_webservice_get_site_info", "moodlewsrestformat": "json"
+        })
+        if not user_data or "exception" in user_data:
+            SERVER_NOTES.append("grades: token rejected")
+            print(f"🛑 Grades Token Rejected: {user_data}")
+            return False, False
 
-    for user in users_list:
-        u_name = user.get("name")
-        u_token = user.get("token")
-        u_chat = user.get("chat_id")
+        user_id = user_data.get("userid")
+        courses = await fetch_data(session, MOODLE_URL, post_data={
+            "wstoken": API_TOKEN, "wsfunction": "core_enrol_get_users_courses",
+            "moodlewsrestformat": "json", "userid": user_id
+        })
+        if not isinstance(courses, list):
+            SERVER_NOTES.append("grades: course list failed")
+            return False, False
 
-        if not u_token or not u_chat: continue
-        if u_name not in memory["private_grades"]: memory["private_grades"][u_name] = {}
+        for course in courses:
+            course_id = str(course['id'])
+            course_name = safe_html(course['fullname'])
+            if course_id in IGNORE_COURSES: continue
 
-        try:
-            # 1. Check if the token is valid
-            user_data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
-                "wstoken": u_token, "wsfunction": "core_webservice_get_site_info", "moodlewsrestformat": "json"
-            }, return_json=True)
-            
-            if not user_data or "exception" in user_data: 
-                print(f"🛑 Grades Token Rejected for {u_name}: {user_data}")
-                # The Anti-Hostage Patch
-                if isinstance(user_data, dict) and user_data.get("errorcode") == "invalidtoken":
-                    print(f"⚠️ {u_name}'s token is dead! Skipping them so the bot doesn't crash.")
-                else:
-                    servers_ok = False 
-                continue
-                
-            user_id = user_data.get("userid")
-            if not user_id: continue
+            if course_id not in memory["grades"]:
+                memory["grades"][course_id] = {}
 
-            # 2. Fetch the user's courses (This is the line that got accidentally deleted!)
-            courses = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
-                "wstoken": u_token, "wsfunction": "core_enrol_get_users_courses", 
-                "moodlewsrestformat": "json", "userid": user_id
-            }, return_json=True)
-            
-            if not isinstance(courses, list): 
-                servers_ok = False
-                continue
-
-            # 3. Scan grades for each course
-            for course in courses:
-                course_id = str(course['id'])
-                course_name = safe_html(course['fullname'])
-                if course_id in IGNORE_COURSES: continue
-
-                if course_id not in memory["private_grades"][u_name]: 
-                    memory["private_grades"][u_name][course_id] = {}
-
-                grade_data = await fetch_data(session, MOODLE_URL, is_moodle=True, post_data={
-                    "wstoken": u_token, "wsfunction": "gradereport_user_get_grade_items",
+            try:
+                grade_data = await fetch_data(session, MOODLE_URL, post_data={
+                    "wstoken": API_TOKEN, "wsfunction": "gradereport_user_get_grade_items",
                     "moodlewsrestformat": "json", "courseid": course_id, "userid": user_id
-                }, return_json=True)
-                
+                })
+            except Exception as e:
+                print(f"⚠️ Grades fetch failed for course {course_id}: {e}")
+                continue
+
+            if isinstance(grade_data, dict) and "usergrades" in grade_data and len(grade_data["usergrades"]) > 0:
                 fetched_grade_items = set()
+                for item in grade_data["usergrades"][0].get("gradeitems", []):
+                    raw_name = item.get("itemname")
+                    raw_grade = item.get("gradeformatted")
+                    if not raw_name or not raw_grade or str(raw_grade).strip() in ["", "-", "None"]:
+                        continue
+                    item_name = safe_html(raw_name)
+                    grade_val = safe_html(raw_grade)
+                    fetched_grade_items.add(item_name)
+                    old_grade = memory["grades"][course_id].get(item_name)
 
-                if isinstance(grade_data, dict) and "usergrades" in grade_data and len(grade_data["usergrades"]) > 0:
-                    for item in grade_data["usergrades"][0].get("gradeitems", []):
-                        raw_name = item.get("itemname")
-                        raw_grade = item.get("gradeformatted")
-                        
-                        if not raw_name or not raw_grade or str(raw_grade).strip() in ["", "-", "None"]: 
-                            continue
-                        
-                        item_name = safe_html(raw_name)
-                        grade_val = safe_html(raw_grade)
-                        
-                        fetched_grade_items.add(item_name)
-                        old_grade = memory["private_grades"][u_name][course_id].get(item_name)
-                        
-                        if old_grade != grade_val:
-                            memory["private_grades"][u_name][course_id][item_name] = grade_val
-                            updates_found = True
-                            
-                            if old_grade is None:
-                                msg = f"🌟 <b>NEW GRADE:</b> {course_name}\n📝 {item_name}\n✅ Score: <b>{grade_val}</b>"
-                            else:
-                                msg = f"⚠️ <b>GRADE UPDATED:</b> {course_name}\n📝 {item_name}\n❌ Old: {old_grade}\n✅ New: <b>{grade_val}</b>"
-                            
-                            print(f"Sending private grade to {u_name}")
-                            await send_telegram(session, msg, u_chat)
+                    if old_grade != grade_val:
+                        memory["grades"][course_id][item_name] = grade_val
+                        updates_found = True
+                        if old_grade is None:
+                            notifications.append(f"🌟 <b>NEW GRADE:</b> {course_name}\n📝 {item_name}\n✅ Score: <b>{grade_val}</b>")
+                        else:
+                            notifications.append(f"⚠️ <b>GRADE UPDATED:</b> {course_name}\n📝 {item_name}\n❌ Old: {old_grade}\n✅ New: <b>{grade_val}</b>")
 
-                    missing_grades = []
-                    for old_item_name in list(memory["private_grades"][u_name][course_id].keys()):
-                        if old_item_name not in fetched_grade_items:
-                            missing_grades.append(old_item_name)
-
-                    for missing_name in missing_grades:
-                        del_msg = f"🗑️ <b>GRADE REMOVED:</b> {course_name}\n📝 {missing_name}\n✅ The professor has deleted this grade from the portal."
-                        print(f"Sending private grade deletion to {u_name}")
-                        await send_telegram(session, del_msg, u_chat)
-                        del memory["private_grades"][u_name][course_id][missing_name]
+                for old_item_name in list(memory["grades"][course_id].keys()):
+                    if old_item_name not in fetched_grade_items:
+                        notifications.append(f"🗑️ <b>GRADE REMOVED:</b> {course_name}\n📝 {old_item_name}\n✅ The professor has deleted this grade from the portal.")
+                        del memory["grades"][course_id][old_item_name]
                         updates_found = True
 
-        except Exception as e:
-            print(f"🚨 Grades Scan Crash for {u_name}: {e}")
-            servers_ok = False
-
-    return updates_found, servers_ok
-
+        return updates_found, True
+    except Exception as e:
+        SERVER_NOTES.append("grades scan crashed")
+        print(f"🚨 Grades Scan Crash: {e}")
+        return False, False
 
 # ==========================================
-# 8. THE CLOUD BATCH TRIGGER
+# 8. MESSAGE HELPERS + MAIN
 # ==========================================
+def chunk_messages(notifs):
+    messages_to_send = []
+    current_msg = f"🤖 <b>Moodle Monitor v{__version__}</b>\n\n"
+    separator = "\n\n〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n\n"
+    for notif in notifs:
+        if len(current_msg) + len(notif) + len(separator) > 3900:
+            messages_to_send.append(current_msg)
+            current_msg = f"🤖 <b>Moodle Monitor v{__version__} (Cont.)</b>\n\n" + notif
+        else:
+            if current_msg.endswith("\n\n"): current_msg += notif
+            else: current_msg += separator + notif
+    messages_to_send.append(current_msg)
+    return messages_to_send
+
+async def run_list_courses(session):
+    print("📚 list-courses mode")
+    try:
+        info = await fetch_data(session, MOODLE_URL, post_data={
+            "wstoken": API_TOKEN, "wsfunction": "core_webservice_get_site_info", "moodlewsrestformat": "json"})
+        if "exception" in info:
+            raise RuntimeError(str(info.get("message")))
+        courses = await fetch_data(session, MOODLE_URL, post_data={
+            "wstoken": API_TOKEN, "wsfunction": "core_enrol_get_users_courses",
+            "moodlewsrestformat": "json", "userid": info.get("userid")})
+        lines = [f"📚 <b>Course list</b> — {safe_html(info.get('fullname', '?'))} (id {info.get('userid')})"]
+        for c in sorted(courses, key=lambda x: x["id"]):
+            end = c.get("enddate") or 0
+            end_s = datetime.datetime.fromtimestamp(end, tz=IRAQ_TZ).strftime("%Y-%m-%d") if end else "no end date"
+            lines.append(f"• <code>{c['id']}</code> — {safe_html(c.get('fullname',''))} (ends {end_s})")
+        msg = "\n".join(lines)
+        print(msg.replace("<code>", "").replace("</code>", "").replace("<b>", "").replace("</b>", ""))
+        if BOT_TOKEN and ADMIN_CHAT_ID:
+            await send_telegram(session, msg, ADMIN_CHAT_ID)
+    except Exception as e:
+        print(f"🚨 list-courses failed: {e}")
+
 async def main():
-    print(f"🚀 Booting Cloud Monitor v{__version__}...")
-    
-    connector = aiohttp.TCPConnector(ssl=False, family=socket.AF_INET)
+    print(f"🤖 Moodle Cloud Monitor v{__version__} | mode={RUN_MODE} | preview={QUIET_RUN} | "
+          f"{datetime.datetime.now(IRAQ_TZ).strftime('%Y-%m-%d %H:%M')} (Iraq)")
+    connector = aiohttp.TCPConnector(family=socket.AF_INET)  # TLS verification is ON
     async with aiohttp.ClientSession(connector=connector) as session:
-        memory = await load_memory(session)
-        
-        # 🛑 THE DATABASE LOCK 🛑
+        problems = config_problems()
+        if problems:
+            await abort_run(session, "Missing configuration: " + ", ".join(problems))
+
+        if RUN_MODE == "list-courses":
+            await run_list_courses(session)
+            return
+
+        if not CHAT_IDS:
+            print("⚠️ CHAT_ID is empty — group broadcasts will go nowhere.")
+
+        memory, err = await load_memory(session)
         if memory is None:
-            print("❌ CRITICAL: Could not read cloud memory. Aborting run to protect database from being wiped.")
-            return 
-            
-        notifications = [] 
-        memory_changed = False
-        
-        # ⚓ STRICT ROUTING ⚓
-        old_chat_ids = memory.get("chat_ids", [])
-        new_chat_ids = list(set([str(cid).strip() for cid in HARDCODED_CHAT_IDS if str(cid).strip() not in ["0", "", "None"]]))
-        
-        if sorted(old_chat_ids) != sorted(new_chat_ids):
-            memory["chat_ids"] = new_chat_ids
-            memory_changed = True
+            await abort_run(session, f"Cloud state unreachable ({err}). Refusing to run blind (database lock).")
 
-        current_admin = ADMIN_CHAT_ID if ADMIN_CHAT_ID else (memory.get("chat_ids", [None])[0] if memory.get("chat_ids") else None)
+        grade_notifications = []  # -> admin only
 
-        users_to_check = [{"name": "Admin", "token": API_TOKEN, "chat_id": current_admin}]
-        
-        users_json = os.environ.get('USERS_CONFIG')
-        if users_json:
-            try:
-                friends_list = json.loads(users_json)
-                users_to_check.extend(friends_list)
-                print(f"👥 Successfully loaded {len(friends_list)} friends from USERS_CONFIG.")
-            except Exception as e:
-                print(f"⚠️ JSON Format Error in USERS_CONFIG. Check your GitHub Secret syntax: {e}")
+        # Snapshot each scanner's section so a failed scanner can't half-save state
+        snap = {
+            "files": json.loads(json.dumps(memory["files"])),
+            "deadlines": json.loads(json.dumps(memory["deadlines"])),
+            "timetable": json.loads(json.dumps(memory["timetable"])),
+            "grades": json.loads(json.dumps(memory["grades"])),
+        }
 
+        n_moodle, n_timetable, n_deadlines = [], [], []
         results = await asyncio.gather(
-            scan_moodle(memory, notifications, session),
-            scan_timetable(memory, notifications, session),
-            scan_deadlines(memory, notifications, session),
-            scan_private_grades(memory, session, users_to_check),
-            return_exceptions=True
+            scan_moodle(memory, n_moodle, session),
+            scan_timetable(memory, n_timetable, session),
+            scan_deadlines(memory, n_deadlines, session),
+            scan_grades(memory, grade_notifications, session),
+            return_exceptions=True,
         )
-        
-        moodle_updated, moodle_ok = results[0] if isinstance(results[0], tuple) else (False, False)
-        timetable_updated, timetable_ok = results[1] if isinstance(results[1], tuple) else (False, False)
-        deadlines_updated, deadlines_ok = results[2] if isinstance(results[2], tuple) else (False, False)
-        grades_updated, grades_ok = results[3] if isinstance(results[3], tuple) else (False, False)
+
+        def unpack(r):
+            return r if isinstance(r, tuple) and len(r) == 2 else (False, False)
+        moodle_updated, moodle_ok = unpack(results[0])
+        timetable_updated, timetable_ok = unpack(results[1])
+        deadlines_updated, deadlines_ok = unpack(results[2])
+        grades_updated, grades_ok = unpack(results[3])
+
+        failures = []
+        if not moodle_ok:
+            failures.append("course files"); memory["files"] = snap["files"]
+        if not timetable_ok:
+            failures.append("timetable"); memory["timetable"] = snap["timetable"]
+        if not deadlines_ok:
+            failures.append("deadlines"); memory["deadlines"] = snap["deadlines"]
+        if not grades_ok:
+            failures.append("grades"); memory["grades"] = snap["grades"]
+        if failures:
+            print(f"⚠️ Scanners failed: {', '.join(failures)} — their state was left untouched (nothing lost).")
 
         any_updates = moodle_updated or timetable_updated or deadlines_updated or grades_updated
         all_servers_ok = moodle_ok and timetable_ok and deadlines_ok and grades_ok
-        
+        memory_changed = False
+
         if not all_servers_ok:
             current_status = memory.get("server_status", "ok")
+            cause = (" — cause: " + "; ".join(dict.fromkeys(SERVER_NOTES))) if SERVER_NOTES else ""
             if current_status == "ok":
-                print("⚠️ Servers missed a beat (Strike 1). Ignoring until next scan.")
+                print("⚠️ Some services missed a beat (Strike 1).")
                 memory["server_status"] = "warning"
                 memory_changed = True
             elif current_status == "warning":
-                if current_admin:
-                    await send_telegram(session, "🚨 <b>SYSTEM ALERT</b>\nCould not connect to the university servers for two consecutive scans. I will stay silent until the connection is restored.", target_chat=current_admin)
-                print("❌ Servers down (Strike 2). Sent failure alert to admin.")
+                await send_alert_dedup(session, f"🚨 <b>SYSTEM ALERT</b>\nSome university services failed two scans in a row{cause}. I'll stay quiet about this until they recover.")
                 memory["server_status"] = "failed"
                 memory_changed = True
             else:
-                print("❌ Servers still down. Remaining silent.")
-                
-        elif all_servers_ok:
+                print("❌ Services still down. Remaining silent.")
+        else:
             current_status = memory.get("server_status", "ok")
             if current_status in ["failed", "warning"]:
-                if current_status == "failed" and current_admin:
-                    await send_telegram(session, "✅ <b>CONNECTION RESTORED</b>\nThe university servers are back online.", target_chat=current_admin)
+                if current_status == "failed" and BOT_TOKEN and ADMIN_CHAT_ID:
+                    await send_telegram(session, "✅ <b>CONNECTION RESTORED</b>\nThe university services are back online.", ADMIN_CHAT_ID)
                 memory["server_status"] = "ok"
                 memory_changed = True
-                print("✅ Servers recovered.")
-                
-            if notifications:
-                messages_to_send = []
-                current_msg = f"🤖 <b>Moodle Monitor v{__version__}</b>\n\n"
-                separator = "\n\n〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n\n"
+                print("✅ Services recovered.")
 
-                for notif in notifications:
-                    if len(current_msg) + len(notif) + len(separator) > 3900:
-                        messages_to_send.append(current_msg)
-                        current_msg = f"🤖 <b>Moodle Monitor v{__version__} (Cont.)</b>\n\n" + notif
-                    else:
-                        if current_msg.endswith("\n\n"): current_msg += notif
-                        else: current_msg += separator + notif
-                
-                messages_to_send.append(current_msg)
-
-                for msg in messages_to_send:
-                    for target_chat in memory.get("chat_ids", []):
-                        await send_telegram(session, msg, target_chat)
-                
+        # Broadcasts — healthy scanners only
+        group_notifs = (n_moodle if moodle_ok else []) + (n_timetable if timetable_ok else []) + (n_deadlines if deadlines_ok else [])
+        if group_notifs:
+            if QUIET_RUN:
+                # Preview mode: the group is skipped; everything comes to YOU to check the format.
+                chunks = chunk_messages(group_notifs)
+                chunks[0] += "\n\n🔍 <i>Preview mode — these normally go to the group.</i>"
+                for msg in chunks:
+                    await send_telegram(session, msg, ADMIN_CHAT_ID)
                 memory_changed = True
-                print(f"✅ Broadcasted {len(notifications)} updates to {len(memory.get('chat_ids', []))} unique chats!")
+                print(f"🛰️ PREVIEW: sent {len(group_notifs)} update(s) to admin only (group skipped).")
+            else:
+                for msg in chunk_messages(group_notifs):
+                    for target in CHAT_IDS:
+                        await send_telegram(session, msg, target)
+                memory_changed = True
+                print(f"✅ Broadcasted {len(group_notifs)} update(s) to {len(CHAT_IDS)} chat(s).")
+        if grade_notifications and grades_ok:
+            for msg in grade_notifications:
+                await send_telegram(session, msg, ADMIN_CHAT_ID)
+            memory_changed = True
+            print(f"🎓 Sent {len(grade_notifications)} grade notice(s) to admin.")
 
         if memory_changed or any_updates:
-            await save_memory(session, memory)
-            print("☁️ Memory changes detected. Saved to JSONBin.")
+            if await save_memory(session, memory):
+                print("☁️ State saved to Supabase.")
         else:
-            print("🛑 Skipped saving to JSONBin (No API request wasted).")
+            print("🛑 No changes — skipped saving (no wasted request).")
+
+        if HEALTHCHECK_URL:
+            try:
+                await fetch_data(session, HEALTHCHECK_URL, return_json=False)
+                print("❤️ Healthcheck ping sent.")
+            except Exception as e:
+                print(f"⚠️ Healthcheck ping failed: {e}")
+
+        print("✅ Run complete.")
 
 if __name__ == "__main__":
     asyncio.run(main())
