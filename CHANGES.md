@@ -1,4 +1,12 @@
-# v2.5.0 — change summary (review guide)
+# v2.5.0/v2.5.1 — change summary (review guide)
+
+## v2.5.1 — deletion patience (bug fix)
+- **"TASK DELETED" now requires 2 consecutive missing runs** before firing — a one-run
+  flicker produces zero messages (previously: instant false alarm).
+- **Calendar-feed items are cleaned up silently** when they disappear; deletion alerts
+  apply to **real assignments only** ("assign_" items).
+- Fixes the false *"The professor has removed it before the deadline!"* class
+  (evidence: last year's "Feedback closes" message).
 
 ## Your seven items
 1. **MOODLE_API_TOKEN** — code reads it; no fallbacks. (Secret already updated ✓)

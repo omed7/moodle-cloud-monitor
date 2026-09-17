@@ -16,6 +16,7 @@
 #     the others' alerts (state is restored, not silently saved)
 #   - No silent fallbacks for missing config, ever
 #   - Download links keep the Moodle token (owner's call; group is trusted)
+#   - v2.5.1: deletion patience (2 consecutive runs) + silent calendar cleanup
 #   - Explicit User-Agent on all requests (Cloudflare-friendly)
 # ==============================================================
 
@@ -31,7 +32,7 @@ import sys
 from bs4 import BeautifulSoup
 from zoneinfo import ZoneInfo
 
-__version__ = "2.5.0"
+__version__ = "2.5.1"
 
 # ==========================================
 # 1. SETUP & CONFIGURATION (no silent fallbacks)
@@ -291,29 +292,50 @@ async def scan_deadlines(memory, notifications, session):
                         notifications.append(f"⚠️ <b>EVENT TIME CHANGED</b>\n📚 {course_name}\n📝 {event_name}\n⏰ New Date: {date_str}")
                     memory["deadlines"][event_id] = {"timestamp": timestamp, "name": event_name, "course": course_name}
 
-        # RULE 3 & RULE 4: DELETIONS & SILENCE
-        keys_to_delete = []
+        # RULE 3 & RULE 4: DELETIONS (with patience) & SILENCE
+        delete_keys = []
         for event_id, event_data in list(memory["deadlines"].items()):
-            if event_id not in fetched_event_ids:
-                if not str(event_id).startswith("assign_") and not str(event_id).startswith("cal_"):
-                    keys_to_delete.append(event_id)
-                    continue
-                ts = event_data.get("timestamp", 0) if isinstance(event_data, dict) else event_data
-                name = event_data.get("name", "Unknown Task") if isinstance(event_data, dict) else "Unknown Task"
-                course = event_data.get("course", "Unknown Course") if isinstance(event_data, dict) else "Unknown Course"
+            if event_id in fetched_event_ids:
+                continue
+            if not isinstance(event_data, dict):
+                delete_keys.append(event_id)  # legacy format — drop silently
+                continue
+            is_assign = str(event_id).startswith("assign_")
 
-                # Rule 3: Deleted BEFORE the deadline was over
+            # Patience: never trust a single missing run (flickers happen).
+            miss = event_data.get("miss", 0)
+            if miss < 2:
+                miss += 1
+                event_data["miss"] = miss
+                updates_found = True
+            if miss < 2:
+                continue
+
+            if is_assign:
+                ts = event_data.get("timestamp", 0)
+                # Rule 3: removed before the deadline was over
                 if ts > current_time or ts == 0:
-                    notifications.append(f"🗑️ <b>TASK DELETED</b>\n📚 {course}\n📝 {name}\n🚨 The professor has removed it before the deadline!")
-                    keys_to_delete.append(event_id)
-                    updates_found = True
-                # Rule 4: Deadline over (stay silent); drop the key only after 7 days
+                    notifications.append(f"🗑️ <b>TASK DELETED</b>\n📚 {event_data.get('course','Unknown Course')}\n📝 {event_data.get('name','Unknown Task')}\n🚨 The professor has removed it before the deadline!")
+                    delete_keys.append(event_id)
+                # Rule 4: deadline over — silent cleanup after 7 days
                 elif ts < (current_time - 604800):
-                    keys_to_delete.append(event_id)
-                    updates_found = True
+                    delete_keys.append(event_id)
+            else:
+                # Calendar-feed items: clean up silently — the feed's composition
+                # changes for non-deletion reasons; never cry wolf for these.
+                delete_keys.append(event_id)
 
-        for key in keys_to_delete:
+        for key in delete_keys:
             del memory["deadlines"][key]
+        if delete_keys:
+            updates_found = True
+
+        # Items seen this run: clear any patience counter
+        for fid in fetched_event_ids:
+            d = memory["deadlines"].get(fid)
+            if isinstance(d, dict) and d.get("miss"):
+                d["miss"] = 0
+                updates_found = True
 
         return updates_found, True
     except Exception as e:
