@@ -17,6 +17,7 @@
 #   - No silent fallbacks for missing config, ever
 #   - Download links keep the Moodle token (owner's call; group is trusted)
 #   - v2.5.1: deletion patience (2 consecutive runs) + silent calendar cleanup
+#   - v2.5.2: one message per assignment (file scanner skips assign modules)
 #   - Explicit User-Agent on all requests (Cloudflare-friendly)
 # ==============================================================
 
@@ -32,7 +33,7 @@ import sys
 from bs4 import BeautifulSoup
 from zoneinfo import ZoneInfo
 
-__version__ = "2.5.1"
+__version__ = "2.5.2"
 
 # ==========================================
 # 1. SETUP & CONFIGURATION (no silent fallbacks)
@@ -478,9 +479,20 @@ async def scan_moodle(memory, notifications, session):
                         section_name = safe_html(section.get("name", "General Topic"))
                         for mod in section.get("modules", []):
                             mod_id = str(mod.get("id"))
-                            fetched_mod_ids.add(mod_id)
                             mod_name = mod.get("name", "Unknown File")
                             mod_type = mod.get("modname", "resource")
+
+                            # Assignments are owned by the deadline scanner (due dates,
+                            # extensions, deletions) — skip them here so the group gets
+                            # one message per assignment. Legacy entries are cleaned up.
+                            if mod_type == "assign":
+                                if mod_id in memory["files"][course_id]:
+                                    del memory["files"][course_id][mod_id]
+                                    updates_found = True
+                                    print(f"🧹 Removed legacy assignment entry: {mod_id}")
+                                continue
+
+                            fetched_mod_ids.add(mod_id)
 
                             time_modified = 0
                             fileurl = ""
@@ -517,6 +529,13 @@ async def scan_moodle(memory, notifications, session):
                     for old_mod_id, old_mod_data in list(memory["files"][course_id].items()):
                         if old_mod_id not in fetched_mod_ids:
                             fname = old_mod_data.get("name", "Unknown File") if isinstance(old_mod_data, dict) else "Unknown File"
+                            # Legacy assignment-module entries (stored before v2.5.2) are
+                            # dropped silently — the deadline scanner owns assignment
+                            # lifecycle, so never report a FILE REMOVED for them.
+                            if fname.startswith("📥 Assignment:"):
+                                del memory["files"][course_id][old_mod_id]
+                                updates_found = True
+                                continue
                             missing_files.append((old_mod_id, fname))
 
                     for missing_id, missing_name in missing_files:
