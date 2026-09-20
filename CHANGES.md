@@ -1,4 +1,12 @@
-# v2.5.0/v2.5.1 — change summary (review guide)
+# v2.5.0/v2.5.1/v2.5.2 — change summary (review guide)
+
+## v2.5.2 — one message per assignment (bug fix)
+- The file scanner no longer reports assignment modules — the deadline scanner is the
+  single owner of assignment events (new / extended / deleted).
+- No duplicate "NEW CONTENT" for a new assignment, and no stray "FILE REMOVED"
+  (legacy entries from older versions are cleaned up silently).
+- No links added to assignment messages (Moodle app-links aren't configured, so any
+  link would open the web — dropped by request).
 
 ## v2.5.1 — deletion patience (bug fix)
 - **"TASK DELETED" now requires 2 consecutive missing runs** before firing — a one-run
