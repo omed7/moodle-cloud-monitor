@@ -1,10 +1,16 @@
 # v2.5.0–v2.5.3 — change summary (review guide)
 
-## v2.5.3 — content-only file scanner (bug fix)
-- The file scanner now announces **content only** (files, folders, web links, pages,
+## v2.5.3 — content-only file scanner + quiz lifecycle (bug fixes)
+- The file scanner announces **content only** (files, folders, web links, pages,
   books). Activity modules (assign, quiz, feedback, choice, lesson...) are skipped
-  entirely — the deadline scanner owns them, so no more duplicates like
-  "NEW CONTENT" + "UPCOMING EVENT" for the same quiz.
+  entirely — no more "NEW CONTENT" duplicate alongside an activity message.
+- **Quizzes now have their own owner** (like assignments): the deadline scanner reads
+  `mod_quiz_get_quizzes_by_courses` and announces **NEW QUIZ ADDED** (with closes
+  date), **QUIZ UPDATED** (close date changed) and **🗑️ QUIZ REMOVED** — so a deleted
+  quiz is reported, exactly like a deleted file. Quiz calendar events are suppressed
+  to keep one message per quiz.
+- Silent adoption avoids deploy spam: quizzes already announced via their calendar
+  event, and quizzes already closed, are stored without a message.
 - Legacy activity entries are cleaned up silently; "FILE REMOVED" applies to
   content only. Stored entries now record their module type.
 
