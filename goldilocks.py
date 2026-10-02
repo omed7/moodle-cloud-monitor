@@ -18,6 +18,7 @@
 #   - Download links keep the Moodle token (owner's call; group is trusted)
 #   - v2.5.1: deletion patience (2 consecutive runs) + silent calendar cleanup
 #   - v2.5.2: one message per assignment (file scanner skips assign modules)
+#   - v2.5.3: content-only file scanner + quiz lifecycle (new/updated/removed)
 #   - Explicit User-Agent on all requests (Cloudflare-friendly)
 # ==============================================================
 
@@ -33,7 +34,7 @@ import sys
 from bs4 import BeautifulSoup
 from zoneinfo import ZoneInfo
 
-__version__ = "2.5.2"
+__version__ = "2.5.3"
 
 # ==========================================
 # 1. SETUP & CONFIGURATION (no silent fallbacks)
@@ -60,6 +61,11 @@ CHAT_IDS = [c.strip() for c in os.environ.get("CHAT_ID", "").split(",") if c.str
 # IGNORE_COURSES: course IDs to skip. Non-numeric junk and the "0" placeholder are dropped.
 IGNORE_COURSES = [c.strip() for c in os.environ.get("IGNORE_COURSES", "").split(",")
                   if c.strip().isdigit() and c.strip() != "0"]
+
+# The file scanner announces CONTENT only. Activity modules are owned by the
+# deadline scanner and are skipped so each event produces exactly one message.
+# If a new content type ever shows up in your courses, add it to this set.
+CONTENT_MODULES = {"resource", "folder", "url", "page", "book"}
 
 TELEGRAM_URL = f"https://moodle-tele-proxy.fy20155.workers.dev/bot{BOT_TOKEN}/sendMessage"
 
@@ -214,11 +220,13 @@ async def scan_deadlines(memory, notifications, session):
             print(f"🛑 Deadlines call failed: {assign_data.get('message')}")
             return False, False
 
+        course_names = {}
         if isinstance(assign_data, dict) and "courses" in assign_data:
             for course_obj in assign_data["courses"]:
                 course_id = str(course_obj.get("id"))
+                course_names[course_id] = safe_html(course_obj.get("fullname", "Unknown Course"))
                 if course_id in IGNORE_COURSES: continue
-                course_name = safe_html(course_obj.get("fullname", "Unknown Course"))
+                course_name = course_names[course_id]
 
                 for assign in course_obj.get("assignments", []):
                     assign_id = "assign_" + str(assign.get("id"))
@@ -261,6 +269,73 @@ async def scan_deadlines(memory, notifications, session):
                         updates_found = True
                         memory["deadlines"][assign_id] = {"timestamp": timestamp, "name": event_name, "course": course_name}
 
+        # Quizzes have their own authoritative feed (assign-style ownership),
+        # so a deleted quiz IS reported — the calendar copy is suppressed below.
+        quiz_params = {}
+        for i, (cid, cname) in enumerate([(c, n) for c, n in course_names.items() if c not in IGNORE_COURSES]):
+            quiz_params[f"courseids[{i}]"] = cid
+        if quiz_params:
+            try:
+                quiz_data = await fetch_data(session, MOODLE_URL, post_data={
+                    "wstoken": API_TOKEN, "wsfunction": "mod_quiz_get_quizzes_by_courses",
+                    "moodlewsrestformat": "json", **quiz_params
+                })
+            except Exception as e:
+                quiz_data = None
+                print(f"⚠️ Quiz feed unavailable this run: {e}")
+            if isinstance(quiz_data, dict) and "exception" in quiz_data:
+                print(f"⚠️ Quiz feed rejected: {quiz_data.get('message')}")
+                quiz_data = None
+
+            for quiz in (quiz_data.get("quizzes", []) if isinstance(quiz_data, dict) else []):
+                quiz_id = "quiz_" + str(quiz.get("id"))
+                if quiz_id in fetched_event_ids: continue
+                fetched_event_ids.add(quiz_id)
+                quiz_name = safe_html(quiz.get("name", "Unknown Quiz"))
+                quiz_course = course_names.get(str(quiz.get("course")), "Unknown Course")
+                quiz_close = quiz.get("timeclose", 0) or 0
+                quiz_open = quiz.get("timeopen", 0) or 0
+
+                old_data = memory["deadlines"].get(quiz_id)
+
+                if not isinstance(old_data, dict) or "timestamp" not in old_data:
+                    notify = True
+                    # Already closed before we ever saw it -> adopt silently.
+                    if quiz_close and quiz_close <= current_time:
+                        notify = False
+                    else:
+                        # Already announced via its calendar event? Adopt silently.
+                        for ck, cd in list(memory["deadlines"].items()):
+                            if str(ck).startswith("cal_") and isinstance(cd, dict) and \
+                               cd.get("name") in (f"{quiz_name} closes", f"{quiz_name} opens"):
+                                del memory["deadlines"][ck]
+                                notify = False
+                                break
+                    memory["deadlines"][quiz_id] = {"timestamp": quiz_close, "name": quiz_name,
+                                                    "course": quiz_course, "open": quiz_open}
+                    updates_found = True
+                    if notify:
+                        if quiz_close:
+                            dt = datetime.datetime.fromtimestamp(quiz_close, tz=IRAQ_TZ).strftime("%A, %b %d at %I:%M %p")
+                            notifications.append(f"📝 <b>NEW QUIZ ADDED</b>\n📚 {quiz_course}\n📝 {quiz_name}\n⏰ Closes: {dt}")
+                        else:
+                            notifications.append(f"📝 <b>NEW QUIZ ADDED</b>\n📚 {quiz_course}\n📝 {quiz_name}\n⏰ Open-ended (no close date)")
+                else:
+                    old_close = old_data.get("timestamp", 0) or 0
+                    if quiz_close != old_close:
+                        if quiz_close == 0 or quiz_close > current_time:
+                            def _fmt(t): return datetime.datetime.fromtimestamp(t, tz=IRAQ_TZ).strftime("%A, %b %d at %I:%M %p") if t else "no close date"
+                            notifications.append(f"📝 <b>QUIZ UPDATED</b>\n📚 {quiz_course}\n📝 {quiz_name}\n❌ Old close: {_fmt(old_close)}\n✅ New close: {_fmt(quiz_close)}")
+                        old_data["timestamp"] = quiz_close
+                        updates_found = True
+                    if old_data.get("open") != quiz_open:
+                        old_data["open"] = quiz_open
+                        updates_found = True
+                    if old_data.get("name") != quiz_name or old_data.get("course") != quiz_course:
+                        old_data["name"] = quiz_name
+                        old_data["course"] = quiz_course
+                        updates_found = True
+
         # Scan Calendar for non-assignment events (limitnum raised so busy weeks aren't cut off)
         cal_data = await fetch_data(session, MOODLE_URL, post_data={
             "wstoken": API_TOKEN, "wsfunction": "core_calendar_get_action_events_by_timesort",
@@ -273,7 +348,7 @@ async def scan_deadlines(memory, notifications, session):
 
         if isinstance(cal_data, dict) and "events" in cal_data:
             for event in cal_data["events"]:
-                if event.get("modulename") == "assign": continue
+                if event.get("modulename") in ("assign", "quiz"): continue
                 event_id = "cal_" + str(event.get("id"))
                 fetched_event_ids.add(event_id)
                 event_name = safe_html(event.get("name", "Unknown Event"))
@@ -302,6 +377,7 @@ async def scan_deadlines(memory, notifications, session):
                 delete_keys.append(event_id)  # legacy format — drop silently
                 continue
             is_assign = str(event_id).startswith("assign_")
+            is_quiz = str(event_id).startswith("quiz_")
 
             # Patience: never trust a single missing run (flickers happen).
             miss = event_data.get("miss", 0)
@@ -312,13 +388,17 @@ async def scan_deadlines(memory, notifications, session):
             if miss < 2:
                 continue
 
-            if is_assign:
+            if is_assign or is_quiz:
                 ts = event_data.get("timestamp", 0)
-                # Rule 3: removed before the deadline was over
+                # Rule 3: removed before it was over
                 if ts > current_time or ts == 0:
-                    notifications.append(f"🗑️ <b>TASK DELETED</b>\n📚 {event_data.get('course','Unknown Course')}\n📝 {event_data.get('name','Unknown Task')}\n🚨 The professor has removed it before the deadline!")
+                    if is_assign:
+                        notifications.append(f"🗑️ <b>TASK DELETED</b>\n📚 {event_data.get('course','Unknown Course')}\n📝 {event_data.get('name','Unknown Task')}\n🚨 The professor has removed it before the deadline!")
+                    else:
+                        reason = "before it closed!" if ts else "from the course!"
+                        notifications.append(f"🗑️ <b>QUIZ REMOVED</b>\n📚 {event_data.get('course','Unknown Course')}\n📝 {event_data.get('name','Unknown Quiz')}\n🚨 The professor has removed it {reason}")
                     delete_keys.append(event_id)
-                # Rule 4: deadline over — silent cleanup after 7 days
+                # Rule 4: already over — silent cleanup after 7 days
                 elif ts < (current_time - 604800):
                     delete_keys.append(event_id)
             else:
@@ -482,14 +562,15 @@ async def scan_moodle(memory, notifications, session):
                             mod_name = mod.get("name", "Unknown File")
                             mod_type = mod.get("modname", "resource")
 
-                            # Assignments are owned by the deadline scanner (due dates,
-                            # extensions, deletions) — skip them here so the group gets
-                            # one message per assignment. Legacy entries are cleaned up.
-                            if mod_type == "assign":
+                            # Content-only: activity modules (assign, quiz, feedback,
+                            # choice, lesson, workshop...) are owned by the deadline
+                            # scanner and would duplicate its messages — skip them.
+                            # Legacy entries are cleaned up silently.
+                            if mod_type not in CONTENT_MODULES:
                                 if mod_id in memory["files"][course_id]:
                                     del memory["files"][course_id][mod_id]
                                     updates_found = True
-                                    print(f"🧹 Removed legacy assignment entry: {mod_id}")
+                                    print(f"🧹 Removed legacy activity entry: {mod_type} {mod_id}")
                                 continue
 
                             fetched_mod_ids.add(mod_id)
@@ -516,11 +597,11 @@ async def scan_moodle(memory, notifications, session):
                             formatted_name = safe_html(format_file_name(mod_name, mod_type))
 
                             if old_time is None:
-                                memory["files"][course_id][mod_id] = {"time": time_modified, "name": formatted_name}
+                                memory["files"][course_id][mod_id] = {"time": time_modified, "name": formatted_name, "type": mod_type}
                                 updates_found = True
                                 notifications.append(f"📢 <b>NEW CONTENT:</b> {course_name}\n📂 Topic: {section_name}\n{formatted_name}{html_link}")
                             elif time_modified != old_time:
-                                memory["files"][course_id][mod_id] = {"time": time_modified, "name": formatted_name}
+                                memory["files"][course_id][mod_id] = {"time": time_modified, "name": formatted_name, "type": mod_type}
                                 updates_found = True
                                 date_str = format_iraq_time(time_modified)
                                 notifications.append(f"🔄 <b>FILE UPDATED:</b> {course_name}\n📂 Topic: {section_name}\n{formatted_name}{date_str}{html_link}")
@@ -529,10 +610,11 @@ async def scan_moodle(memory, notifications, session):
                     for old_mod_id, old_mod_data in list(memory["files"][course_id].items()):
                         if old_mod_id not in fetched_mod_ids:
                             fname = old_mod_data.get("name", "Unknown File") if isinstance(old_mod_data, dict) else "Unknown File"
-                            # Legacy assignment-module entries (stored before v2.5.2) are
-                            # dropped silently — the deadline scanner owns assignment
-                            # lifecycle, so never report a FILE REMOVED for them.
-                            if fname.startswith("📥 Assignment:"):
+                            stored_type = old_mod_data.get("type") if isinstance(old_mod_data, dict) else None
+                            # Activity entries (or pre-v2.5.3 legacy ones) are dropped
+                            # silently — the deadline scanner owns activity lifecycle,
+                            # so never report a FILE REMOVED for them.
+                            if (stored_type is not None and stored_type not in CONTENT_MODULES) or fname.startswith("📥 Assignment:"):
                                 del memory["files"][course_id][old_mod_id]
                                 updates_found = True
                                 continue
