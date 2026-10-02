@@ -1,4 +1,12 @@
-# v2.5.0/v2.5.1/v2.5.2 — change summary (review guide)
+# v2.5.0–v2.5.3 — change summary (review guide)
+
+## v2.5.3 — content-only file scanner (bug fix)
+- The file scanner now announces **content only** (files, folders, web links, pages,
+  books). Activity modules (assign, quiz, feedback, choice, lesson...) are skipped
+  entirely — the deadline scanner owns them, so no more duplicates like
+  "NEW CONTENT" + "UPCOMING EVENT" for the same quiz.
+- Legacy activity entries are cleaned up silently; "FILE REMOVED" applies to
+  content only. Stored entries now record their module type.
 
 ## v2.5.2 — one message per assignment (bug fix)
 - The file scanner no longer reports assignment modules — the deadline scanner is the

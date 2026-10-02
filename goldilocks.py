@@ -18,6 +18,7 @@
 #   - Download links keep the Moodle token (owner's call; group is trusted)
 #   - v2.5.1: deletion patience (2 consecutive runs) + silent calendar cleanup
 #   - v2.5.2: one message per assignment (file scanner skips assign modules)
+#   - v2.5.3: content-only file scanner (activity modules never announced here)
 #   - Explicit User-Agent on all requests (Cloudflare-friendly)
 # ==============================================================
 
@@ -33,7 +34,7 @@ import sys
 from bs4 import BeautifulSoup
 from zoneinfo import ZoneInfo
 
-__version__ = "2.5.2"
+__version__ = "2.5.3"
 
 # ==========================================
 # 1. SETUP & CONFIGURATION (no silent fallbacks)
@@ -60,6 +61,11 @@ CHAT_IDS = [c.strip() for c in os.environ.get("CHAT_ID", "").split(",") if c.str
 # IGNORE_COURSES: course IDs to skip. Non-numeric junk and the "0" placeholder are dropped.
 IGNORE_COURSES = [c.strip() for c in os.environ.get("IGNORE_COURSES", "").split(",")
                   if c.strip().isdigit() and c.strip() != "0"]
+
+# The file scanner announces CONTENT only. Activity modules are owned by the
+# deadline scanner and are skipped so each event produces exactly one message.
+# If a new content type ever shows up in your courses, add it to this set.
+CONTENT_MODULES = {"resource", "folder", "url", "page", "book"}
 
 TELEGRAM_URL = f"https://moodle-tele-proxy.fy20155.workers.dev/bot{BOT_TOKEN}/sendMessage"
 
@@ -482,14 +488,15 @@ async def scan_moodle(memory, notifications, session):
                             mod_name = mod.get("name", "Unknown File")
                             mod_type = mod.get("modname", "resource")
 
-                            # Assignments are owned by the deadline scanner (due dates,
-                            # extensions, deletions) — skip them here so the group gets
-                            # one message per assignment. Legacy entries are cleaned up.
-                            if mod_type == "assign":
+                            # Content-only: activity modules (assign, quiz, feedback,
+                            # choice, lesson, workshop...) are owned by the deadline
+                            # scanner and would duplicate its messages — skip them.
+                            # Legacy entries are cleaned up silently.
+                            if mod_type not in CONTENT_MODULES:
                                 if mod_id in memory["files"][course_id]:
                                     del memory["files"][course_id][mod_id]
                                     updates_found = True
-                                    print(f"🧹 Removed legacy assignment entry: {mod_id}")
+                                    print(f"🧹 Removed legacy activity entry: {mod_type} {mod_id}")
                                 continue
 
                             fetched_mod_ids.add(mod_id)
@@ -516,11 +523,11 @@ async def scan_moodle(memory, notifications, session):
                             formatted_name = safe_html(format_file_name(mod_name, mod_type))
 
                             if old_time is None:
-                                memory["files"][course_id][mod_id] = {"time": time_modified, "name": formatted_name}
+                                memory["files"][course_id][mod_id] = {"time": time_modified, "name": formatted_name, "type": mod_type}
                                 updates_found = True
                                 notifications.append(f"📢 <b>NEW CONTENT:</b> {course_name}\n📂 Topic: {section_name}\n{formatted_name}{html_link}")
                             elif time_modified != old_time:
-                                memory["files"][course_id][mod_id] = {"time": time_modified, "name": formatted_name}
+                                memory["files"][course_id][mod_id] = {"time": time_modified, "name": formatted_name, "type": mod_type}
                                 updates_found = True
                                 date_str = format_iraq_time(time_modified)
                                 notifications.append(f"🔄 <b>FILE UPDATED:</b> {course_name}\n📂 Topic: {section_name}\n{formatted_name}{date_str}{html_link}")
@@ -529,10 +536,11 @@ async def scan_moodle(memory, notifications, session):
                     for old_mod_id, old_mod_data in list(memory["files"][course_id].items()):
                         if old_mod_id not in fetched_mod_ids:
                             fname = old_mod_data.get("name", "Unknown File") if isinstance(old_mod_data, dict) else "Unknown File"
-                            # Legacy assignment-module entries (stored before v2.5.2) are
-                            # dropped silently — the deadline scanner owns assignment
-                            # lifecycle, so never report a FILE REMOVED for them.
-                            if fname.startswith("📥 Assignment:"):
+                            stored_type = old_mod_data.get("type") if isinstance(old_mod_data, dict) else None
+                            # Activity entries (or pre-v2.5.3 legacy ones) are dropped
+                            # silently — the deadline scanner owns activity lifecycle,
+                            # so never report a FILE REMOVED for them.
+                            if (stored_type is not None and stored_type not in CONTENT_MODULES) or fname.startswith("📥 Assignment:"):
                                 del memory["files"][course_id][old_mod_id]
                                 updates_found = True
                                 continue
