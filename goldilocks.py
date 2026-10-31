@@ -19,6 +19,7 @@
 #   - v2.5.1: deletion patience (2 consecutive runs) + silent calendar cleanup
 #   - v2.5.2: one message per assignment (file scanner skips assign modules)
 #   - v2.5.3: content-only file scanner + quiz lifecycle (new/updated/removed)
+#   - v2.5.4: opt-in single-topic delivery for one group
 #   - Explicit User-Agent on all requests (Cloudflare-friendly)
 # ==============================================================
 
@@ -34,7 +35,7 @@ import sys
 from bs4 import BeautifulSoup
 from zoneinfo import ZoneInfo
 
-__version__ = "2.5.3"
+__version__ = "2.5.4"
 
 # ==========================================
 # 1. SETUP & CONFIGURATION (no silent fallbacks)
@@ -57,6 +58,12 @@ MOODLE_URL = f"{SITE_URL}/webservice/rest/server.php" if SITE_URL else ""
 
 # Recipients: exactly the IDs listed in the repo Variable. Nobody else, ever.
 CHAT_IDS = [c.strip() for c in os.environ.get("CHAT_ID", "").split(",") if c.strip()]
+
+# Opt-in: route ONLY the named group's existing combined broadcasts to one topic.
+# Leave unset until a manual test confirms the topic; all other recipients stay as-is.
+TOPIC_CHAT_ID = os.environ.get("MOODLE_TOPIC_CHAT_ID", "").strip()
+TOPIC_THREAD_RAW = os.environ.get("MOODLE_TOPIC_THREAD_ID", "").strip()
+TOPIC_ENABLED = os.environ.get("MOODLE_TOPIC_ENABLED", "").strip() == "1"
 
 # IGNORE_COURSES: course IDs to skip. Non-numeric junk and the "0" placeholder are dropped.
 IGNORE_COURSES = [c.strip() for c in os.environ.get("IGNORE_COURSES", "").split(",")
@@ -85,7 +92,17 @@ def config_problems():
         "SUPABASE_URL": SUPABASE_URL,
         "SUPABASE_KEY": SUPABASE_KEY,
     }
-    return [k for k, v in required.items() if not v]
+    problems = [k for k, v in required.items() if not v]
+    if TOPIC_ENABLED or RUN_MODE == "test-topic":
+        if (not TOPIC_CHAT_ID.startswith("-100") or len(TOPIC_CHAT_ID) <= 4
+                or not TOPIC_CHAT_ID[1:].isascii() or not TOPIC_CHAT_ID[1:].isdigit()):
+            problems.append("MOODLE_TOPIC_CHAT_ID must be a supergroup chat ID")
+        if TOPIC_CHAT_ID not in CHAT_IDS:
+            problems.append("MOODLE_TOPIC_CHAT_ID must be in CHAT_ID")
+        if (not TOPIC_THREAD_RAW.isascii() or not TOPIC_THREAD_RAW.isdigit()
+                or len(TOPIC_THREAD_RAW) > 19 or int(TOPIC_THREAD_RAW or "0") < 1):
+            problems.append("MOODLE_TOPIC_THREAD_ID must be a positive number")
+    return problems
 
 # ==========================================
 # 2. NETWORK HELPERS
@@ -111,12 +128,22 @@ async def fetch_data(session, url, post_data=None, json_body=None, return_json=T
         resp.raise_for_status()
         return await resp.json() if return_json else await resp.text()
 
-async def send_telegram(session, message, target_chat):
-    """Send one message. Failures are logged — never silent."""
+def topic_thread_for(target_chat):
+    """Only the configured group gets a topic ID; private chats get none."""
+    if TOPIC_ENABLED and str(target_chat) == TOPIC_CHAT_ID:
+        return int(TOPIC_THREAD_RAW)
+    return None
+
+async def send_telegram(session, message, target_chat, message_thread_id=None):
+    """Send one message, optionally to a group topic. Failures are logged."""
     payload = {"chat_id": target_chat, "text": message, "parse_mode": "HTML",
                "disable_web_page_preview": True}
+    if message_thread_id is not None:
+        payload["message_thread_id"] = message_thread_id
     try:
-        await fetch_data(session, TELEGRAM_URL, post_data=payload)
+        result = await fetch_data(session, TELEGRAM_URL, post_data=payload)
+        if isinstance(result, dict) and result.get("ok") is False:
+            raise RuntimeError(result.get("description", "Telegram rejected the message"))
         await asyncio.sleep(1)
         return True
     except Exception as e:
@@ -756,6 +783,16 @@ async def main():
         if problems:
             await abort_run(session, "Missing configuration: " + ", ".join(problems))
 
+        if RUN_MODE == "test-topic":
+            # Sends one harmless message only; never scans or touches Supabase.
+            sent = await send_telegram(session, "🧪 Moodle Monitor topic test — no course data was scanned.",
+                                       TOPIC_CHAT_ID, message_thread_id=int(TOPIC_THREAD_RAW))
+            if not sent:
+                print("❌ Topic test failed. Normal group routing is still disabled.")
+                raise SystemExit(1)
+            print("✅ Topic test sent. Normal group routing is still disabled.")
+            return
+
         if RUN_MODE == "list-courses":
             await run_list_courses(session)
             return
@@ -843,9 +880,21 @@ async def main():
                 memory_changed = True
                 print(f"🛰️ PREVIEW: sent {len(group_notifs)} update(s) to admin only (group skipped).")
             else:
+                # Try the topic group first. If it rejects the thread ID, do not
+                # save the new baseline: alert the admin and retry next run.
+                targets = CHAT_IDS
+                if TOPIC_ENABLED:
+                    targets = sorted(CHAT_IDS, key=lambda chat: chat != TOPIC_CHAT_ID)
                 for msg in chunk_messages(group_notifs):
-                    for target in CHAT_IDS:
-                        await send_telegram(session, msg, target)
+                    for target in targets:
+                        thread_id = topic_thread_for(target)
+                        sent = await send_telegram(session, msg, target, message_thread_id=thread_id)
+                        if thread_id is not None and not sent:
+                            await send_alert_dedup(session, "🚨 <b>MOODLE TOPIC DELIVERY FAILED</b>\n"
+                                                  "Group alerts could not be delivered to the configured topic. "
+                                                  "State was not saved; they will be retried on the next run. "
+                                                  "Check the topic settings and the run log.")
+                            raise SystemExit(1)
                 memory_changed = True
                 print(f"✅ Broadcasted {len(group_notifs)} update(s) to {len(CHAT_IDS)} chat(s).")
         if grade_notifications and grades_ok:

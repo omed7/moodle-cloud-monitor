@@ -1,4 +1,15 @@
-# v2.5.0–v2.5.3 — change summary (review guide)
+# v2.5.0–v2.5.4 — change summary (review guide)
+
+## v2.5.4 — one group topic for all shared updates
+- The current combined update message is unchanged. Only the configured group
+  receives `message_thread_id`; private recipients keep their normal chat messages.
+  Grades and system alerts stay in the admin chat.
+- **Disabled by default.** A manual `test-topic` run sends one harmless message to
+  the topic without scanning Moodle or changing Supabase. Enable routing only after
+  the test is confirmed in Telegram.
+- If Telegram rejects a live topic send, the run fails and does not save that
+  update to Supabase; the admin is alerted so delivery can be corrected and retried.
+  A partially completed multi-chunk send may repeat a chunk on retry.
 
 ## v2.5.3 — content-only file scanner + quiz lifecycle (bug fixes)
 - The file scanner announces **content only** (files, folders, web links, pages,
