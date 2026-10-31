@@ -6,7 +6,7 @@ on:
       mode:
         description: 'Run mode'
         type: choice
-        options: [scan, list-courses]
+        options: [scan, list-courses, test-topic]
         default: scan
 
 permissions:
@@ -38,6 +38,9 @@ jobs:
           MOODLE_API_URL: ${{ secrets.MOODLE_API_URL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ vars.CHAT_ID }}
+          MOODLE_TOPIC_CHAT_ID: ${{ vars.MOODLE_TOPIC_CHAT_ID }}
+          MOODLE_TOPIC_THREAD_ID: ${{ vars.MOODLE_TOPIC_THREAD_ID }}
+          MOODLE_TOPIC_ENABLED: ${{ vars.MOODLE_TOPIC_ENABLED }}
           ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
           TIMETABLE_URL: ${{ secrets.TIMETABLE_URL }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}

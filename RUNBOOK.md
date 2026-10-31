@@ -22,6 +22,25 @@ GitHub → repo → Settings → Secrets and variables → Actions
 **Variables:** `CHAT_ID` (who gets alerts) · `IGNORE_COURSES` ("0" = nobody) ·
 `QUIET_RUN` (1 = preview: admin-only) · `HEALTHCHECK_URL` (optional)
 
+## Send all shared updates to one group topic (optional)
+- Keep `CHAT_ID` unchanged; it still lists every broadcast recipient.
+- Once this PR is merged, create **two** repository Variables:
+  `MOODLE_TOPIC_CHAT_ID` = the group's `-100…` ID;
+  `MOODLE_TOPIC_THREAD_ID` = the topic's number from its share link.
+  **Do not create `MOODLE_TOPIC_ENABLED` yet.** Until enabled, group delivery
+  continues exactly as before (no topic routing).
+- Actions → Moodle Cloud Monitor → Run workflow → mode `test-topic`. This sends
+  one harmless test message **to the topic only**; it does not scan Moodle or
+  touch Supabase. Check that the message landed in the intended topic.
+- Only after the test succeeds, create the Variable `MOODLE_TOPIC_ENABLED` = `1`.
+  Future combined alerts go to that topic in the group; other `CHAT_ID` recipients
+  keep normal messages. Grades and system alerts remain private to `ADMIN_CHAT_ID`.
+- To stop routing, delete `MOODLE_TOPIC_ENABLED` (or change it to `0`).
+  This restores the former group delivery on the next run. Old messages stay put.
+- A failed topic send fails the run and does not save those updates; correct the
+  setting or disable routing, then the next run retries. With multiple message
+  chunks, a chunk sent before the failure could be repeated on retry.
+
 ## System alerts (sent to ADMIN chat only) — what each one means
 | Alert | When it fires | What it means · what to do |
 |---|---|---|
