@@ -785,7 +785,7 @@ async def main():
 
         if RUN_MODE == "test-topic":
             # Sends one harmless message only; never scans or touches Supabase.
-            sent = await send_telegram(session, "🧪 Moodle Monitor topic test — no course data was scanned.",
+            sent = await send_telegram(session, "test",
                                        TOPIC_CHAT_ID, message_thread_id=int(TOPIC_THREAD_RAW))
             if not sent:
                 print("❌ Topic test failed. Normal group routing is still disabled.")

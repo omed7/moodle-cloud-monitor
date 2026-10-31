@@ -75,6 +75,7 @@ class TopicRoutingTests(unittest.IsolatedAsyncioTestCase):
             await self.m.main()
         send.assert_awaited_once()
         args, kwargs = send.await_args
+        self.assertEqual("test", args[1])
         self.assertEqual("-10042", args[2])
         self.assertEqual(2468, kwargs["message_thread_id"])
 
