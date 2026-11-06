@@ -41,6 +41,14 @@ GitHub → repo → Settings → Secrets and variables → Actions
   setting or disable routing, then the next run retries. With multiple message
   chunks, a chunk sent before the failure could be repeated on retry.
 
+## Assignment deadline changes
+When a professor changes an existing assignment's due date, **both** earlier and
+later dates generate a shared update with the previous date, new date and time
+changed. Adding/removing a due date from an open-ended assignment is reported
+separately. These go to the same recipients/topic as other course updates;
+private grades and system alerts still go to the admin. Previously missed changes
+cannot be replayed from Supabase after the old date was overwritten.
+
 ## System alerts (sent to ADMIN chat only) — what each one means
 | Alert | When it fires | What it means · what to do |
 |---|---|---|

@@ -20,6 +20,7 @@
 #   - v2.5.2: one message per assignment (file scanner skips assign modules)
 #   - v2.5.3: content-only file scanner + quiz lifecycle (new/updated/removed)
 #   - v2.5.4: opt-in single-topic delivery for one group
+#   - v2.5.5: notify on earlier and later assignment due dates
 #   - Explicit User-Agent on all requests (Cloudflare-friendly)
 # ==============================================================
 
@@ -35,7 +36,7 @@ import sys
 from bs4 import BeautifulSoup
 from zoneinfo import ZoneInfo
 
-__version__ = "2.5.4"
+__version__ = "2.5.5"
 
 # ==========================================
 # 1. SETUP & CONFIGURATION (no silent fallbacks)
@@ -231,6 +232,25 @@ async def save_memory(session, memory):
 # ==========================================
 # 4. DEADLINES & CALENDAR SCANNER
 # ==========================================
+def assignment_due_label(timestamp):
+    if not timestamp:
+        return "No due date"
+    return datetime.datetime.fromtimestamp(timestamp, tz=IRAQ_TZ).strftime(
+        "%A, %b %d, %Y at %I:%M %p")
+
+
+def assignment_time_difference(seconds):
+    """Human-readable magnitude of a due-date change (timestamps are seconds)."""
+    days, remainder = divmod(abs(seconds), 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+    parts = []
+    for count, unit in ((days, "day"), (hours, "hour"), (minutes, "minute")):
+        if count:
+            parts.append(f"{count} {unit}{'s' if count != 1 else ''}")
+    return ", ".join(parts) or "less than a minute"
+
+
 async def scan_deadlines(memory, notifications, session):
     print("⏳ Scanning Assignments & Deadlines...")
     updates_found = False
@@ -276,25 +296,30 @@ async def scan_deadlines(memory, notifications, session):
                             notifications.append(f"🚨 <b>NEW ASSIGNMENT ADDED</b>\n📚 {course_name}\n📝 {event_name}\n⏰ Due: {date_str}")
                         memory["deadlines"][assign_id] = {"timestamp": timestamp, "name": event_name, "course": course_name}
 
-                    # RULE 2: Deadline extended
-                    elif timestamp > old_timestamp:
+                    # RULE 2: Any change to an existing due date (both directions).
+                    elif timestamp != old_timestamp:
                         updates_found = True
-                        extended_by_seconds = timestamp - old_timestamp
-                        days = extended_by_seconds // 86400
-                        hours = (extended_by_seconds % 86400) // 3600
-                        if days > 0 and hours > 0: time_added = f"{days} day(s) and {hours} hour(s)"
-                        elif days > 0: time_added = f"{days} day(s)"
-                        elif hours > 0: time_added = f"{hours} hour(s)"
-                        else: time_added = "less than an hour"
-                        dt = datetime.datetime.fromtimestamp(timestamp, tz=IRAQ_TZ)
-                        date_str = dt.strftime("%A, %b %d at %I:%M %p")
-                        notifications.append(f"⏰ <b>DEADLINE EXTENDED</b>\n📚 {course_name}\n📝 {event_name}\n⏳ Extended by: {time_added}\n📅 Current Deadline: {date_str}")
-                        memory["deadlines"][assign_id] = {"timestamp": timestamp, "name": event_name, "course": course_name}
-
-                    # Silently update memory if shortened
-                    elif timestamp != old_timestamp and timestamp < old_timestamp:
-                        updates_found = True
-                        memory["deadlines"][assign_id] = {"timestamp": timestamp, "name": event_name, "course": course_name}
+                        previous = assignment_due_label(old_timestamp)
+                        current = assignment_due_label(timestamp)
+                        if old_timestamp == 0:
+                            heading = "⏰ <b>DUE DATE SET</b>"
+                            change = ""
+                        elif timestamp == 0:
+                            heading = "⏰ <b>DUE DATE REMOVED</b>"
+                            change = ""
+                        elif timestamp > old_timestamp:
+                            heading = "⏰ <b>DEADLINE EXTENDED</b>"
+                            change = f"⏳ Extended by: {assignment_time_difference(timestamp - old_timestamp)}\n"
+                        else:
+                            heading = "⚠️ <b>DEADLINE MOVED EARLIER</b>"
+                            change = f"⏳ Shortened by: {assignment_time_difference(old_timestamp - timestamp)}\n"
+                        notifications.append(
+                            f"{heading}\n📚 {course_name}\n📝 {event_name}\n{change}"
+                            f"📅 Previous Deadline: {previous}\n📅 New Deadline: {current}"
+                        )
+                        memory["deadlines"][assign_id] = {
+                            "timestamp": timestamp, "name": event_name, "course": course_name
+                        }
 
         # Quizzes have their own authoritative feed (assign-style ownership),
         # so a deleted quiz IS reported — the calendar copy is suppressed below.

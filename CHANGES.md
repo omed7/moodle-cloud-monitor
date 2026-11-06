@@ -1,4 +1,14 @@
-# v2.5.0–v2.5.4 — change summary (review guide)
+# v2.5.0–v2.5.5 — change summary (review guide)
+
+## v2.5.5 — assignment deadline changes in both directions
+- Existing assignments now alert the group when the due date moves **earlier** or
+  **later**. Each notice includes the old and new Iraq dates (with year) and the
+  amount shortened/extended. A repeated scan of the same date is silent.
+- A switch between **no due date** and a dated deadline is reported as
+  "DUE DATE SET" or "DUE DATE REMOVED", not mislabeled as an extension/shortening.
+- Assignment state continues to update in Supabase. This change cannot reconstruct
+  old dates already overwritten before deployment; there is no automatic replay
+  of the previously missed change.
 
 ## v2.5.4 — one group topic for all shared updates
 - The current combined update message is unchanged. Only the configured group
